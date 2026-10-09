@@ -1,0 +1,176 @@
+# =============================================================================
+# rag-zh 基础设施编排
+#
+# 服务：
+#   1. qdrant      —— 向量库（int8 量化 + on_disk_payload + HNSW on_disk）
+#   2. minio       —— 原文（PDF/DOCX/...）对象存储
+#   3. mcp-server  —— 本仓库代码构建出的 MCP 服务（stdio 由宿主直启，sse 走这里）
+#
+# -----------------------------------------------------------------------------
+# 内存限制说明（按 profile 调整）
+#
+#   profile       | mcp-server | qdrant  | minio  | 宿主机最低总内存
+#   --------------|------------|---------|--------|----------------
+#   lite          | 4g         | 2g      | 1g     | 16g（无 GPU / 机械盘）
+#   standard      | 10g        | 6g      | 2g     | 32g（SSD，可选 GPU）
+#   performance   | 24g        | 16g     | 4g     | 64g + GPU
+#
+#   两种改法，任选其一：
+#     A. 改 .env（或导出环境变量）：RAG_ZH_MEM_LIMIT_MCP / _QDRANT / _MINIO
+#     B. 直接改下面各服务的 mem_limit 字面量
+#   注意：memory 是硬上限（超限 OOM kill）。embedding / reranker 加载权重时
+#   峰值内存最高，lite 档请把 batch_size 保持 4 并确认 device=cpu。
+#   GPU 显存不受此处限制，由 config/settings.yaml 的 device 字段控制。
+#
+#   profile=auto 时，先运行 `python config/autodetect.py` 查看探测结果，
+#   再把对应档位写进 .env 后 `docker compose up -d`。
+#
+# 数据落盘（均不进 git 仓库）：
+#   ./storage/qdrant  向量 + payload
+#   ./storage/minio   原文对象
+#   ./storage/models  embedding / reranker / OCR 权重缓存
+#   ./data            待入库的原始文件
+# =============================================================================
+
+name: rag-zh
+
+# ---- 共用片段 --------------------------------------------------------------
+x-mcp-common-env: &mcp-common-env
+  # profile：auto 时由 config/autodetect.py 自动探测并覆盖
+  RAG_ZH_PROFILE: ${RAG_ZH_PROFILE:-auto}
+  RAG_ZH_CONFIG_DIR: /app/config
+  RAG_ZH_DATA_DIR: /app/data
+  RAG_ZH_STORAGE_DIR: /app/storage
+  # 向量库
+  QDRANT_HOST: qdrant
+  QDRANT_PORT: "6333"
+  QDRANT_GRPC_PORT: "6334"
+  QDRANT_COLLECTION: ${QDRANT_COLLECTION:-rag_zh_chunks}
+  # 对象存储
+  MINIO_ENDPOINT: minio:9000
+  MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
+  MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
+  MINIO_BUCKET: ${MINIO_BUCKET:-rag-zh-raw}
+  MINIO_SECURE: "false"
+  # 模型缓存目录（挂载 ./storage/models，避免每次重建镜像都重新下载权重）
+  HF_HOME: /app/storage/models/huggingface
+  PADDLE_PDX_CACHE_HOME: /app/storage/models/paddle
+  # 日志
+  RAG_ZH_LOG_LEVEL: ${RAG_ZH_LOG_LEVEL:-INFO}
+  PYTHONUNBUFFERED: "1"
+
+services:
+
+  # ===========================================================================
+  # Qdrant —— 向量库
+  # ===========================================================================
+  qdrant:
+    image: qdrant/qdrant:v1.12.0
+    container_name: rag-zh-qdrant
+    restart: unless-stopped
+    ports:
+      - "${QDRANT_HTTP_PORT:-6333}:6333"   # REST
+      - "${QDRANT_GRPC_PORT_HOST:-6334}:6334"  # gRPC（写入更快，100GB 库推荐）
+    environment:
+      QDRANT__LOG_LEVEL: INFO
+    volumes:
+      - ./storage/qdrant:/qdrant/storage
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+      memlock:
+        soft: -1
+        hard: -1
+    mem_limit: ${RAG_ZH_MEM_LIMIT_QDRANT:-8g}
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "wget -q -O - http://127.0.0.1:6333/readyz || exit 1"
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - rag-zh-net
+
+  # ===========================================================================
+  # MinIO —— 原文对象存储
+  # ===========================================================================
+  minio:
+    image: minio/minio:RELEASE.2024-10-29T15-25-56Z
+    container_name: rag-zh-minio
+    restart: unless-stopped
+    command: ["server", "/data", "--console-address", ":9001"]
+    ports:
+      - "${MINIO_API_PORT:-9000}:9000"     # S3 API
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"  # Web 控制台
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-minioadmin}
+      MINIO_CONSOLE_ADDRESS: ":9001"
+    volumes:
+      - ./storage/minio:/data
+    mem_limit: ${RAG_ZH_MEM_LIMIT_MINIO:-2g}
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "mc ready local || mc alias set local http://127.0.0.1:9000 ${MINIO_ACCESS_KEY:-minioadmin} ${MINIO_SECRET_KEY:-minioadmin} || exit 1"
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks:
+      - rag-zh-net
+
+  # ===========================================================================
+  # MCP Server —— 本仓库代码（FastMCP，stdio + sse 双 transport）
+  #   - stdio：宿主直接 `python -m mcp_server.server`（客户端如 Claude Desktop）
+  #   - sse  ：容器内 `python -m mcp_server.server --sse`，对外暴露 8000
+  # ===========================================================================
+  mcp-server:
+    build:
+      context: .
+      dockerfile: Dockerfile        # 后续批次提供；本批 compose 仅声明构建入口
+      args:
+        # 有 GPU 时置为 cuda-enabled 的基础镜像层配置；lite/standard 用默认 CPU 镜像
+        RAG_ZH_DEVICE: ${RAG_ZH_DEVICE:-cpu}
+    image: rag-zh/mcp-server:latest
+    container_name: rag-zh-mcp-server
+    restart: unless-stopped
+    # 默认走 sse；本地调试 stdio 时用 `docker compose run --rm mcp-server python -m mcp_server.server`
+    command: ["python", "-m", "mcp_server.server", "--sse"]
+    environment:
+      <<: *mcp-common-env
+      MCP_TRANSPORT: sse
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: "8000"
+    ports:
+      - "${MCP_SSE_PORT:-8000}:8000"
+    volumes:
+      - ./data:/app/data
+      - ./storage:/app/storage
+      - ./config:/app/config
+    mem_limit: ${RAG_ZH_MEM_LIMIT_MCP:-10g}
+    # 有 GPU 时取消注释（lite 档请保持注释，纯 CPU 推理）
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+    depends_on:
+      qdrant:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    networks:
+      - rag-zh-net
+
+networks:
+  rag-zh-net:
+    driver: bridge
+
+# 说明：这里不声明 volumes 段，qdrant / minio 的数据全部 bind 到宿主 ./storage，
+# 便于整库备份与迁移，也保证 `docker compose down -v` 不会误删 100GB 索引。

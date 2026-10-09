@@ -1,0 +1,161 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://rag-zh.local/schemas/mcp_tools.schema.json",
+  "title": "rag-zh MCP Tools",
+  "description": "6 个对外 MCP 工具的输入/输出契约（与 mcp_server/tools.py 的 docstring 一致）。",
+  "type": "object",
+  "properties": {
+    "tools": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "description", "inputSchema"],
+        "properties": {
+          "name": {"type": "string"},
+          "description": {"type": "string"}
+        }
+      }
+    }
+  },
+  "toolDefinitions": {
+    "search": {
+      "description": "混合检索知识库，返回带引用的 top-k 片段。",
+      "inputSchema": {
+        "type": "object",
+        "required": ["query"],
+        "properties": {
+          "query": {"type": "string", "description": "自然语言问题或关键词"},
+          "top_k": {"type": "integer", "default": 5, "minimum": 1, "maximum": 50},
+          "mode": {"type": "string", "enum": ["semantic", "keyword", "fuzzy", "hybrid"], "default": "hybrid"},
+          "filters": {
+            "type": ["object", "null"],
+            "description": "元数据过滤，透传 Qdrant + SQLite",
+            "properties": {
+              "doc_type": {"type": "string"},
+              "language": {"type": "string"},
+              "has_table": {"type": "boolean"},
+              "source_format": {"type": "string"}
+            },
+            "additionalProperties": true
+          }
+        }
+      },
+      "outputSchema": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "required": ["chunk_id", "content", "score", "doc_id"],
+          "properties": {
+            "chunk_id": {"type": "string"},
+            "content": {"type": "string"},
+            "score": {"type": "number", "description": "rerank_score（经精排）"},
+            "metadata": {"type": "object"},
+            "section_path": {"type": "string"},
+            "doc_id": {"type": "string"},
+            "bbox": {"type": ["array", "null"], "items": {"type": "number"}}
+          }
+        }
+      }
+    },
+    "ingest": {
+      "description": "导入文件或目录，跑完整入库流水线。",
+      "inputSchema": {
+        "type": "object",
+        "required": ["path"],
+        "properties": {
+          "path": {"type": "string", "description": "文件或目录路径"}
+        }
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "total": {"type": "integer"},
+          "done": {"type": "integer"},
+          "partial": {"type": "integer"},
+          "error": {"type": "integer"},
+          "n_chunks": {"type": "integer"},
+          "elapsed": {"type": "number"},
+          "reports": {"type": "array"}
+        }
+      }
+    },
+    "get_chunk": {
+      "description": "按 chunk_id 取回片段完整内容。",
+      "inputSchema": {
+        "type": "object",
+        "required": ["chunk_id"],
+        "properties": {
+          "chunk_id": {"type": "string"}
+        }
+      },
+      "outputSchema": {
+        "type": "object",
+        "description": "chunk 记录，或 {error, detail}"
+      }
+    },
+    "list_documents": {
+      "description": "列出已入库文档（可过滤）。",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "filters": {
+            "type": ["object", "null"],
+            "properties": {
+              "doc_type": {"type": "string"},
+              "language": {"type": "string"},
+              "source_format": {"type": "string"},
+              "limit": {"type": "integer", "default": 100},
+              "offset": {"type": "integer", "default": 0}
+            }
+          }
+        }
+      },
+      "outputSchema": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "doc_id": {"type": "string"},
+            "path": {"type": "string"},
+            "source_format": {"type": "string"},
+            "doc_type": {"type": "string"},
+            "language": {"type": "string"},
+            "created_at": {"type": "string"}
+          }
+        }
+      }
+    },
+    "get_document_url": {
+      "description": "获取原始文档的 MinIO 预签名下载 URL。",
+      "inputSchema": {
+        "type": "object",
+        "required": ["doc_id"],
+        "properties": {
+          "doc_id": {"type": "string"}
+        }
+      },
+      "outputSchema": {
+        "type": "string",
+        "description": "预签名 URL，或 'error: ...' 字符串"
+      }
+    },
+    "classify_image": {
+      "description": "对图片做 zero-shot 场景分类（Chinese-CLIP）。",
+      "inputSchema": {
+        "type": "object",
+        "required": ["image_path"],
+        "properties": {
+          "image_path": {"type": "string"}
+        }
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "label": {"type": "string"},
+          "confidence": {"type": "number"},
+          "topk": {"type": "object"}
+        }
+      }
+    }
+  }
+}

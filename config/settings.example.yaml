@@ -1,0 +1,280 @@
+# =============================================================================
+# rag-zh 配置模板
+#
+# 用法：
+#   cp config/settings.example.yaml config/settings.yaml   （settings.yaml 已 gitignore）
+#   然后把 profile 设为 auto / lite / standard / performance
+#
+# profile:
+#   auto        —— 由 config/autodetect.py 探测内存/GPU/磁盘后覆盖为下面三档之一
+#   lite        —— 无独显 + 内存 <16GB，纯 CPU，索引全部 on_disk
+#   standard    —— 16GB 内存 + SSD（可选 GPU），默认推荐档
+#   performance —— GPU + >=32GB 内存，HNSW 常驻内存，大 batch 并发入库
+#
+# 每个档位下的字段含义完全一致，只是取值不同；程序只读「合并后的最终 dict」，
+# 不做 profile 分支判断，方便后续新增档位。
+# =============================================================================
+
+profile: auto                       # auto | lite | standard | performance
+
+# -----------------------------------------------------------------------------
+# 三档硬件画像
+# -----------------------------------------------------------------------------
+profiles:
+
+  lite:
+    description: "内存 <=16GB（或机械盘 / 核数不足）。索引一切换磁盘，牺牲延迟保可用"
+    # lite 也允许用 GPU：bge-small-zh-v1.5 仅 ~100MB，显存压力可忽略；
+    # 无 GPU 时 autodetect 会把 auto 解析为 cpu，并把 use_fp16 强制关掉
+    device: auto                    # cpu | cuda | cuda:0 | auto
+    dtype: fp32                     # CPU 上不做半精度（部分老 CPU 无 fp16 支持会报错）
+    embedding_model: BAAI/bge-small-zh-v1.5
+    embedding_dim: 512              # bge-small-zh-v1.5 的 dense 维度
+    supports_sparse: false          # 该模型不产出 BGE-M3 的 lexical_weights
+    # sparse 路不可用时，路由层按 exact/dense 权重归一化重新分配，不补零向量
+    max_seq_length: 512
+    batch_size: 4
+    use_fp16: false
+    reranker:
+      enabled: true                 # 精度优先，保留重排
+      model: BAAI/bge-reranker-v2-m3
+      max_length: 512
+      batch_size: 4
+      # lite 档用 CPU 交叉编码器很慢，只重排 20 条，别调大
+    qdrant:
+      quantization: int8            # 向量量化，内存/磁盘减半
+      on_disk: true                 # HNSW 图结构放磁盘
+      payload_on_disk: true         # payload 放磁盘
+      hnsw_m: 8
+      hnsw_ef_construct: 100
+      hnsw_ef_search: 64
+      indexing_threshold: 100000    # 超过该点数值量才建索引，避免入库期抖动
+      workers: 2
+    chunk_workers: 2                # multiprocessing.Pool 进程数
+    index_workers: 2
+
+  standard:
+    description: "16GB+ 内存 + SSD。默认档，精度与延迟平衡"
+    device: auto                    # autodetect 会填 cuda（有 GPU）或 cpu
+    dtype: fp16                     # GPU 上半精度；CPU 会被自动降级为 fp32
+    embedding_model: BAAI/bge-m3
+    embedding_dim: 1024             # bge-m3 dense 维度
+    supports_sparse: true           # bge-m3 同时输出 sparse(lexical_weights)
+    max_seq_length: 1024
+    batch_size: 16
+    use_fp16: true
+    reranker:
+      enabled: true
+      model: BAAI/bge-reranker-v2-m3
+      max_length: 1024
+      batch_size: 16
+    qdrant:
+      quantization: int8
+      on_disk: true
+      payload_on_disk: true
+      hnsw_m: 16
+      hnsw_ef_construct: 200
+      hnsw_ef_search: 128
+      indexing_threshold: 0
+      workers: 4
+    chunk_workers: 4
+    index_workers: 4
+
+  performance:
+    description: "GPU + >=32GB 内存 + NVMe。HNSW 常驻内存，追求召回延迟与入库吞吐"
+    device: cuda
+    dtype: fp16
+    embedding_model: BAAI/bge-m3
+    embedding_dim: 1024
+    supports_sparse: true
+    max_seq_length: 1024
+    batch_size: 128
+    use_fp16: true
+    reranker:
+      enabled: true
+      model: BAAI/bge-reranker-v2-m3
+      max_length: 1024
+      batch_size: 64
+    qdrant:
+      quantization: int8
+      on_disk: false                # 全内存图，毫秒级召回
+      payload_on_disk: false
+      hnsw_m: 32
+      hnsw_ef_construct: 400
+      hnsw_ef_search: 256
+      indexing_threshold: 0
+      workers: 8
+    chunk_workers: 8
+    index_workers: 8
+
+# -----------------------------------------------------------------------------
+# 切分（Chunking）
+#   表格 / 图片 / slide / sheet 类型走各自专用切分器，不套用这里的文本参数
+# -----------------------------------------------------------------------------
+chunking:
+  chunk_size: 384                   # 目标 chunk 中文字符数
+  chunk_overlap: 64                 # 相邻 chunk 重叠字符数
+  min_chunk_size: 48                # 过短片段并入前一块，不单独成 chunk
+  respect_sentence_boundary: true   # 仅在句子/段落边界切，不硬截断
+  separators: ["\n\n", "\n", "。", "！", "？", "。", "；", "，", " "]
+  table_as_chunk: true              # 表格独立成 chunk_type=table，保留行列结构
+  max_table_rows_per_chunk: 30      # 超长表格按行分片，每片重复表头
+
+# -----------------------------------------------------------------------------
+# 检索链路
+#   Query → 路由(权重字典) → 四路召回(exact/fuzzy/sparse/dense)
+#        → 加权 RRF(k=60) → Rerank(top20→top10) → Context 组装
+# -----------------------------------------------------------------------------
+retrieval:
+  rrf_k: 60
+  rrf_weights:
+    exact: 1.0
+    fuzzy: 0.6
+    sparse: 1.0
+    dense: 1.0
+  route_candidates:                 # 每路各自召回多少条进入 RRF
+    exact: 50
+    fuzzy: 20
+    sparse: 50
+    dense: 50
+  recall_top_k: 50                  # RRF 融合后保留条数
+  rerank:
+    enabled: true
+    candidates_in: 20               # 送进 reranker 的条数
+    output_top_k: 10                # rerank 后保留条数
+    score_threshold: 0.15           # 低于此分直接丢弃（宁可少给不要给错）
+  # ---- 模糊路 ---------------------------------------------------------------
+  fuzzy_score_cutoff: 75            # RapidFuzz 0-100 分阈值，低于则丢弃
+  fuzzy_top_k: 10
+  ngram_top_k: 20                   # n-gram 倒排候选扩展规模（召回 stage1）
+  ngram_n: 2                        # 中文以 2-gram 为主（单字信息量不足）
+  fuzzy_algorithms: [token_set_ratio, partial_ratio, ratio]
+  fuzzy_min_similarity: 0.6         # n-gram Jaccard 种子筛选阈值
+  # 注意：fuzzy 结果只作为 RRF 的一路候选，绝不允许绕过 rerank 直接给 LLM
+  fuzzy_output_allowed_bypass_rerank: false
+
+# -----------------------------------------------------------------------------
+# Context 组装
+# -----------------------------------------------------------------------------
+context:
+  max_context_chars: 12000          # 拼装后交给 LLM 的最大字符数
+  per_chunk_max_chars: 1200         # 单 chunk 超长时按相关性截断
+  include_section_path: true        # 带上「文档名 > 章节 > 小节」定位串
+  include_source_citation: true     # 每条带 doc_id + chunk_id + 页码，供引用回溯
+  dedup_overlap_ratio: 0.85         # 相邻 chunk 重叠度超此值时合并，省 token
+  order_by: document                # document(按原文顺序) | score(按分数)
+
+# -----------------------------------------------------------------------------
+# 向量化
+# -----------------------------------------------------------------------------
+embedding:
+  normalize_dense: true             # dense 向量 L2 归一化，配合 cosine
+  sparse_encoding_type: lexical_weights   # BGE-M3 稀疏输出形式
+  sparse_weight_dtype: float32
+  image_embedding_model: Chinese-CLIP/ViT-B-16
+  image_embedding_dim: 512
+  image_collection: rag_zh_images   # 图片向量单独一个 collection
+
+# -----------------------------------------------------------------------------
+# Qdrant 连接
+# -----------------------------------------------------------------------------
+qdrant:
+  host: ${QDRANT_HOST:-localhost}
+  port: ${QDRANT_PORT:-6333}
+  grpc_port: ${QDRANT_GRPC_PORT:-6334}
+  prefer_grpc: true                 # 100GB 入库走 gRPC，吞吐显著优于 REST
+  api_key: null
+  https: false
+  collection: rag_zh_chunks
+  text_field: content
+  vector_fields:
+    dense: dense
+    sparse: sparse
+  distance: Cosine
+  timeout: 120
+  # 批量写入参数（与 profile.batch_size 解耦，控制「多少个 chunk 提交一次」）
+  upload:
+    parallel: 4
+    max_wait_seconds: 30
+
+# -----------------------------------------------------------------------------
+# MinIO 连接（原文存储，仓库里不放任何真实密钥）
+# -----------------------------------------------------------------------------
+minio:
+  endpoint: ${MINIO_ENDPOINT:-localhost:9000}
+  access_key: ${MINIO_ACCESS_KEY:-minioadmin}
+  secret_key: ${MINIO_SECRET_KEY:-minioadmin}
+  bucket: ${MINIO_BUCKET:-rag-zh-raw}
+  secure: false
+  region: us-east-1
+  # 对象命名规则：{source_format}/{doc_id}/{原文件名}，便于按来源批量清理
+  object_key_prefix: raw
+  presigned_expire_seconds: 3600
+
+# -----------------------------------------------------------------------------
+# SQLite（精确索引 + 模糊索引 + 元数据）
+# -----------------------------------------------------------------------------
+sqlite:
+  exact_db_path: storage/sqlite/exact_fts.sqlite     # FTS5 + jieba 预分词
+  fuzzy_db_path: storage/sqlite/fuzzy.sqlite         # n-gram 倒排 + 同义词
+  meta_db_path: storage/sqlite/metadata.sqlite       # 统一 Metadata Schema
+  journal_mode: wal                                  # 并发读写必需
+  synchronous: normal
+  timeout_seconds: 30
+
+# -----------------------------------------------------------------------------
+# OCR / 解析
+# -----------------------------------------------------------------------------
+parsing:
+  ocr:
+    engine: PaddleOCR
+    model: ch_PP-OCRv4
+    lang: ch
+    use_angle_cls: true
+    det: true
+    # 只对「文本层字符数 < 阈值」的页启用 OCR，扫描件才走全页识别
+    enable_page_ocr_when_chars_below: 20
+    dpi: 200
+  pdf:
+    text_engine: pymupdf           # 文本块 + bbox
+    table_engine: pdfplumber       # 表格结构（line/strategy 可调）
+    table_strategy: lines
+  extract_images: true
+  image_min_side_px: 120            # 小于此尺寸的图标/装饰图跳过，不入库
+
+# -----------------------------------------------------------------------------
+# 停用词 / 同义词
+# -----------------------------------------------------------------------------
+lexicon:
+  synonyms_path: config/synonyms.yaml      # 格式 {主词: [同义词...]}，加载后做双向展开
+  stopwords_path: config/stopwords_zh.txt  # 每行一个词，纯文本无注释，UTF-8
+  # 停用词只用于「关键词提取 / n-gram 模糊索引降噪」，
+  # exact(FTS5) 路不做整句停用词剔除，避免丢掉「2024年」「华东」这类限定词
+  stopwords_scope: [keyword_extract, fuzzy_ngram]
+  jieba_dict_path: null             # 可指向自定义用户词典 txt
+  jieba_user_dict_paths: []
+
+# -----------------------------------------------------------------------------
+# MCP 接口
+# -----------------------------------------------------------------------------
+mcp:
+  # stdio：供 Claude Desktop 等客户端直接拉起（推荐本地使用）
+  # sse  ：供 Web / 远程客户端使用，对应 docker-compose 的 8000 端口
+  transports: [stdio, sse]
+  sse:
+    host: 0.0.0.0
+    port: 8000
+  server_name: rag-zh
+  instructions: "中文文档三模检索（语义/精确/模糊），返回带引用的 top-k 片段"
+
+# -----------------------------------------------------------------------------
+# 日志与运行时
+# -----------------------------------------------------------------------------
+runtime:
+  log_level: ${RAG_ZH_LOG_LEVEL:-INFO}
+  log_dir: logs
+  seed: 42
+  # 断点续跑：入库任务状态表记录 (doc_id -> status)，失败文件不阻塞整体
+  resume: true
+  fail_fast: false
+  max_retries_per_doc: 2

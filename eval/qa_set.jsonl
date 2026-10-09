@@ -1,0 +1,20 @@
+{"query": "新员工入职需要办理哪些手续", "expected_chunk_ids": [], "expected_keywords": ["入职", "手续"], "type": "semantic"}
+{"query": "公司的年假制度是怎么规定的", "expected_chunk_ids": [], "expected_keywords": ["年假"], "type": "semantic"}
+{"query": "出差费用应该如何申请报销", "expected_chunk_ids": [], "expected_keywords": ["报销"], "type": "semantic"}
+{"query": "这个平台主要提供哪些功能", "expected_chunk_ids": [], "expected_keywords": ["功能"], "type": "semantic"}
+{"query": "项目进度延期了应该怎么处理", "expected_chunk_ids": [], "expected_keywords": ["延期"], "type": "semantic"}
+{"query": "第三条 违约责任的具体内容", "expected_chunk_ids": [], "expected_keywords": ["违约责任"], "type": "exact"}
+{"query": "什么是\"商业秘密\"", "expected_chunk_ids": [], "expected_keywords": ["商业秘密"], "type": "exact"}
+{"query": "合同编号 HT-2024-001", "expected_chunk_ids": [], "expected_keywords": ["HT-2024-001"], "type": "exact"}
+{"query": "2024年年度审计报告", "expected_chunk_ids": [], "expected_keywords": ["审计"], "type": "exact"}
+{"query": "劳动合统一该怎么签", "expected_chunk_ids": [], "expected_keywords": ["劳动合同"], "type": "fuzzy"}
+{"query": "保密协议书模板", "expected_chunk_ids": [], "expected_keywords": ["保密协议"], "type": "fuzzy"}
+{"query": "请假条摸板在哪里下载", "expected_chunk_ids": [], "expected_keywords": ["请假"], "type": "fuzzy"}
+{"query": "甲方法定表人是谁", "expected_chunk_ids": [], "expected_keywords": ["法定代表人"], "type": "fuzzy"}
+{"query": "各部门季度预算是多少", "expected_chunk_ids": [], "expected_keywords": ["预算"], "type": "table"}
+{"query": "2024年第一季度的营收数据", "expected_chunk_ids": [], "expected_keywords": ["营收"], "type": "table"}
+{"query": "员工职级与薪资等级对照表", "expected_chunk_ids": [], "expected_keywords": ["薪资"], "type": "table"}
+{"query": "各供应商交货周期统计表", "expected_chunk_ids": [], "expected_keywords": ["交货"], "type": "table"}
+{"query": "系统的整体架构图", "expected_chunk_ids": [], "expected_keywords": ["架构"], "type": "image"}
+{"query": "过去一年销售数据的柱状图", "expected_chunk_ids": [], "expected_keywords": ["销售"], "type": "image"}
+{"query": "公司的组织架构示意图", "expected_chunk_ids": [], "expected_keywords": ["组织"], "type": "image"}

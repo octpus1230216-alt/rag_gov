@@ -1,0 +1,78 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://rag-zh.local/schemas/chunk.schema.json",
+  "title": "Chunk",
+  "description": "统一 Chunk 结构（第 3 批定义）。ingestion.pipeline 的 chunk 阶段产出、embedding/index 阶段消费的都是本结构。chunk_id 稳定：由 doc_id + 内容决定，重复入库幂等。",
+  "type": "object",
+  "required": ["chunk_id", "doc_id", "content", "chunk_type"],
+  "additionalProperties": true,
+  "properties": {
+    "chunk_id": {
+      "type": "string",
+      "description": "片段唯一 ID，sha256(doc_id + 归一化内容 + chunk 序号) 前 16 位。内容不变则 ID 不变，保证重复入库幂等。",
+      "minLength": 8
+    },
+    "doc_id": {
+      "type": "string",
+      "description": "所属文档 ID，来自 compute_doc_id()（策略见 pipeline：bytes/content/path_mtime）。",
+      "minLength": 8
+    },
+    "content": {
+      "type": "string",
+      "description": "片段正文。表格为 markdown/制表符还原的结构化文本；图片为其 OCR/描述文本。"
+    },
+    "chunk_type": {
+      "type": "string",
+      "description": "片段类型，决定切分与检索处理路径。",
+      "enum": ["text", "table", "image", "slide", "sheet"]
+    },
+    "section_path": {
+      "type": "string",
+      "description": "定位串，形如 '文档名 > 一级标题 > 二级标题'。用于 context 组装时保持原文顺序。",
+      "default": ""
+    },
+    "metadata": {
+      "type": "object",
+      "description": "统一 Metadata Schema 的片段级扩展字段。",
+      "additionalProperties": true,
+      "properties": {
+        "chunk_index": {
+          "type": "integer",
+          "description": "该 chunk 在文档内的序号，用于相邻合并判断。"
+        },
+        "token_estimate": {
+          "type": "integer",
+          "description": "粗估 token 数（中文按 len*0.6）。"
+        },
+        "page": {
+          "type": "integer",
+          "description": "来源页码（PDF/PPTX）。"
+        },
+        "language": {
+          "type": "string",
+          "description": "片段语言代码，如 zh/en。"
+        },
+        "has_table": {
+          "type": "boolean",
+          "description": "该片段是否含表格内容。"
+        }
+      }
+    },
+    "bbox": {
+      "type": "array",
+      "description": "PDF 原文定位框 [x0, y0, x1, y1]（点单位）。非 PDF 或无定位时为 null/缺省。",
+      "items": {
+        "type": "number"
+      },
+      "minItems": 4,
+      "maxItems": 4
+    },
+    "pages": {
+      "type": "array",
+      "description": "该片段覆盖的页码列表（跨页表格/文本块）。",
+      "items": {
+        "type": "integer"
+      }
+    }
+  }
+}

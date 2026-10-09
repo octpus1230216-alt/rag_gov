@@ -1,0 +1,172 @@
+# =============================================================================
+# rag-zh —— 高级中文 RAG 系统（语义 + 精确 + 模糊 三模检索）
+#
+# 安装：
+#   python -m venv .venv
+#   .venv\Scripts\activate        （Windows）  /  source .venv/bin/activate （Linux）
+#   pip install -U pip
+#   # CPU 机器（lite / standard 无 GPU）建议走 PyTorch CPU 索引，省 2GB 显存依赖：
+#   #   pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cpu
+#   # GPU 机器（performance）直接 pip install -e ".[dev]"
+#   pip install -e ".[dev]"
+#
+# 版本锁定原则：
+#   - 运行时依赖全部 ==，避免 100GB 索引重建
+#   - embedding / reranker / OCR 权重文件名写死在 config/settings.yaml，
+#     升级模型需显式改配置，不跟随依赖自动漂移
+# =============================================================================
+
+[project]
+name = "rag-zh"
+version = "0.1.0"
+description = "高级中文 RAG 系统：dense/sparse(BGE-M3) + FTS5 精确 + RapidFuzz 模糊 四路召回，加权 RRF 融合 + Rerank，对外暴露 FastMCP(stdio/sse)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "rag-zh" }]
+keywords = ["rag", "chinese", "qdrant", "bge-m3", "mcp"]
+
+classifiers = [
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Text Processing :: Indexing",
+]
+
+dependencies = [
+    # ---- MCP 接口（stdio + sse 双 transport） --------------------------------
+    "fastmcp==2.2.0",
+
+    # ---- 向量库客户端（int8 量化 / on_disk_payload / HNSW on_disk） ----------
+    "qdrant-client==1.12.1",
+
+    # ---- Embedding：BAAI/bge-m3（dense + sparse）与降级 bge-small-zh-v1.5 ----
+    # FlagEmbedding 自带 BGEM3FlagModel，同时输出 dense 与 lexical_weights(sparse)
+    "FlagEmbedding==1.2.10",
+    "transformers==4.46.3",
+    "torch==2.5.1",
+
+    # ---- 图片 Embedding：Chinese-CLIP ---------------------------------------
+    "open-clip-torch==2.26.1",
+
+    # ---- OCR：PaddleOCR（ch_PP-OCRv4） --------------------------------------
+    "paddlepaddle==3.0.0",
+    "paddleocr==2.9.1",
+
+    # ---- 文档解析：PDF 双引擎（PyMuPDF 取文本块+bbox，pdfplumber 取表格） ----
+    "pymupdf==1.24.14",
+    "pdfplumber==0.11.4",
+
+    # ---- Office 解析 ---------------------------------------------------------
+    "python-docx==1.1.2",
+    "python-pptx==1.0.2",
+    "openpyxl==3.1.5",
+
+    # ---- 解析层辅助 ----------------------------------------------------------
+    # 编码探测：txt 的 BOM/严格解码都失败后走统计法（禁止 errors="ignore" 静默丢字）
+    "charset-normalizer==3.4.0",
+    # 图片尺寸判定 + OCR 前转 ndarray（paddleocr 也依赖，但这里是我们直接 import 的）
+    "Pillow==10.4.0",
+    "numpy==1.26.4",
+
+    # ---- 精确索引分词（SQLite FTS5 前先 jieba 切词，不能用默认 tokenizer） ----
+    "jieba==0.42.1",
+
+    # ---- 模糊索引打分（禁用 fuzzywuzzy / python-Levenshtein） ----------------
+    "rapidfuzz==3.10.1",
+
+    # ---- 原文对象存储 --------------------------------------------------------
+    "minio==7.2.12",
+
+    # ---- 配置 / 资源探测 ----------------------------------------------------
+    "pyyaml==6.0.2",
+    "psutil==6.0.0",
+
+    # ---- 入库流水线进度条（缺失时 pipeline 会自动退化成纯文本进度） ----------
+    "tqdm==4.67.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==8.3.4",
+    "ruff==0.8.4",
+    "mypy==1.13.0",
+]
+
+[project.scripts]
+rag-zh-autodetect = "config.autodetect:main"
+
+# =============================================================================
+# 构建后端：本仓库是扁平多包布局（config/ ingestion/ retrieval/ mcp_server/ ...）
+# =============================================================================
+[build-system]
+requires = ["setuptools==75.1.0", "wheel==0.43.0"]
+build-backend = "setuptools.build_meta"
+
+# 自动发现命名空间包：只收录磁盘上真实存在的目录，
+# 这样分批开发时（解析/切分/检索包还没建出来）也能 `pip install -e .` 成功
+[tool.setuptools.packages.find]
+where = ["."]
+namespaces = true
+exclude = [
+    "data*",
+    "storage*",
+    "models*",
+    "samples*",
+    "parsed*",
+    "chunks*",
+    "vectors*",
+    "logs*",
+    "tests*",
+    "_ignore_check*",
+]
+
+[tool.setuptools.package-data]
+config = ["*.yaml", "*.yml", "*.txt"]
+
+# =============================================================================
+# 工具链
+# =============================================================================
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+# 向量库 / 原文 / 模型权重不进仓库，也不参与静态检查
+extend-exclude = ["storage", "data", "models", "parsed", "chunks", "vectors", "logs"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "C4", "SIM", "RUF"]
+ignore = [
+    "E501",   # 中文注释较长，不按字符数折行
+    "SIM108", # 三元表达式可读性优先
+    "UP009",  # 保留 # -*- coding: utf-8 -*- 显式声明（Windows 中文机器默认 GBK）
+    "UP038",  # isinstance 继续用 (X, Y) 元组写法，跨版本可读性优先
+    # 本仓库注释/字符串里必然大量使用全角标点（：，。（）），这几条是纯噪声
+    "RUF001",
+    "RUF002",
+    "RUF003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"config/autodetect.py" = ["E402"]  # torch 需在 try/except 后按需导入
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.mypy]
+python_version = "3.10"
+# 只检查磁盘上已存在的包；后续批次新增 ingestion/parsing/chunking/embedding/
+# indexing/retrieval/mcp_server 后，把它们依次追加到这里
+files = ["config"]
+ignore_missing_imports = true   # paddleocr / FlagEmbedding / open_clip 无 type stub
+warn_unused_ignores = false
+disallow_untyped_defs = false   # 骨架批次先放开，检索批次逐步收紧
+check_untyped_defs = true
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+addopts = "-ra -q"
+markers = [
+    "slow: 需要加载模型权重或外部服务（qdrant/minio）的测试",
+    "integration: 需要 docker compose 起服务的端到端测试",
+]
