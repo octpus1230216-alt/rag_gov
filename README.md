@@ -1,7 +1,7 @@
 # rag-zh · 高级中文 RAG 系统
 
-面向中文办公文档（PDF / Word / Excel / PPT / 图片）的**三模检索增强生成**引擎：
-语义 + 精确 + 模糊四路召回，加权 RRF 融合 + 交叉编码器重排，对外以 **MCP** 标准协议暴露工具，可直接接入 Claude Desktop 等 LLM 客户端。
+面向中文办公文档（PDF / Word / Excel / PPT / 图片）的**多模态检索增强生成**引擎：
+精确 + 模糊 + 稀疏向量 + 稠密向量四路召回，加权 RRF 融合 + 交叉编码器重排，对外以 **MCP** 标准协议暴露工具，可直接接入 Claude Desktop 等 LLM 客户端。
 
 ---
 
@@ -50,7 +50,7 @@ flowchart TD
 
 ```bash
 # ① 克隆
-git clone <your-repo>/rag-zh.git && cd rag-zh
+git clone https://github.com/octpus1230216-alt/rag_gov.git && cd rag_gov
 python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -U pip
 
@@ -206,4 +206,5 @@ A：本系统在写入前用 jieba **预分词**再进 FTS5（`unicode61`），�
 
 ## 10. 许可
 
-内部项目示例，按需替换 `<your-repo>` 与许可证声明。
+本仓库为个人学习与作品展示用途，未附加开源许可证。代码仅供阅读参考；
+如需使用、修改或分发，请先联系仓库所有者取得授权。
