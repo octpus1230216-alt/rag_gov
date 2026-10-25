@@ -5,10 +5,13 @@
 #   python -m venv .venv
 #   .venv\Scripts\activate        （Windows）  /  source .venv/bin/activate （Linux）
 #   pip install -U pip
-#   # CPU 机器（lite / standard 无 GPU）建议走 PyTorch CPU 索引，省 2GB 显存依赖：
-#   #   pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cpu
-#   # GPU 机器（performance）直接 pip install -e ".[dev]"
+#   # 轻量（推荐日常开发 / CI）：只装解析/检索/生成所需，不含 GB 级重模型
 #   pip install -e ".[dev]"
+#   # 完整（要跑向量化/OCR/图片 CLIP）：追加 models extras
+#   #   GPU 机器：pip install -e ".[dev,models]"
+#   #   CPU 机器建议先走 PyTorch CPU 索引省显存：
+#   #     pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cpu
+#   #     pip install -e ".[dev,models]"
 #
 # 版本锁定原则：
 #   - 运行时依赖全部 ==，避免 100GB 索引重建
@@ -36,22 +39,22 @@ classifiers = [
 dependencies = [
     # ---- MCP 接口（stdio + sse 双 transport） --------------------------------
     "fastmcp==2.2.0",
+    # fastmcp 2.2.0 从 pydantic._internal._typing_extra 导入 eval_type_backport，
+    # 该符号在 pydantic 2.10+ 已移除，必须锁在 2.9.x，否则 import fastmcp 直接崩。
+    "pydantic==2.9.2",
+
+    # ---- 生成层：OpenAI 兼容大模型客户端 + 指数退避重试 ----------------------
+    # 一个 openai SDK 覆盖 OpenAI/DeepSeek/通义/vLLM/Ollama 兼容模式（换 base_url 即可）
+    "openai==1.57.0",
+    "tenacity==9.0.0",
 
     # ---- 向量库客户端（int8 量化 / on_disk_payload / HNSW on_disk） ----------
     "qdrant-client==1.12.1",
 
-    # ---- Embedding：BAAI/bge-m3（dense + sparse）与降级 bge-small-zh-v1.5 ----
-    # FlagEmbedding 自带 BGEM3FlagModel，同时输出 dense 与 lexical_weights(sparse)
-    "FlagEmbedding==1.2.10",
-    "transformers==4.46.3",
-    "torch==2.5.1",
-
-    # ---- 图片 Embedding：Chinese-CLIP ---------------------------------------
-    "open-clip-torch==2.26.1",
-
-    # ---- OCR：PaddleOCR（ch_PP-OCRv4） --------------------------------------
-    "paddlepaddle==3.0.0",
-    "paddleocr==2.9.1",
+    # 注：向量化（FlagEmbedding/transformers/torch）、图片 CLIP（open-clip-torch）、
+    # OCR（paddlepaddle/paddleocr）这几组 GB 级重依赖已下移到可选 extras
+    # [project.optional-dependencies].models。代码里全部是函数内惰性 import，
+    # 离线（解析/切分/检索路由/生成降级）不装它们也能跑，CI 只装 .[dev] 秒级完成。
 
     # ---- 文档解析：PDF 双引擎（PyMuPDF 取文本块+bbox，pdfplumber 取表格） ----
     "pymupdf==1.24.14",
@@ -87,10 +90,27 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# 重模型依赖：只有向量化 / 图片 CLIP / OCR 阶段才需要，代码内均为惰性 import。
+# 完整入库/检索链路或生产部署：pip install -e ".[dev,models]"
+models = [
+    # ---- Embedding：BAAI/bge-m3（dense + sparse）与降级 bge-small-zh-v1.5 ----
+    # FlagEmbedding 自带 BGEM3FlagModel，同时输出 dense 与 lexical_weights(sparse)
+    "FlagEmbedding==1.2.10",
+    "transformers==4.46.3",
+    "torch==2.5.1",
+    # ---- 图片 Embedding：Chinese-CLIP ---------------------------------------
+    "open-clip-torch==2.26.1",
+    # ---- OCR：PaddleOCR（ch_PP-OCRv4） --------------------------------------
+    "paddlepaddle==3.0.0",
+    "paddleocr==2.9.1",
+]
 dev = [
     "pytest==8.3.4",
+    "pytest-cov==5.0.0",
     "ruff==0.8.4",
     "mypy==1.13.0",
+    # 本地提交前门禁（可选，见 .pre-commit-config.yaml）；CI 不装也不影响
+    "pre-commit==4.0.1",
 ]
 
 [project.scripts]
@@ -154,19 +174,56 @@ quote-style = "double"
 
 [tool.mypy]
 python_version = "3.10"
-# 只检查磁盘上已存在的包；后续批次新增 ingestion/parsing/chunking/embedding/
-# indexing/retrieval/mcp_server 后，把它们依次追加到这里
-files = ["config"]
+# 逐包扩展：骨架批次已纳入 config，本批追加 generation / retrieval。
+# 后续批次（ingestion / index / mcp_server）清完存量噪声后依次追加。
+files = ["config", "generation", "retrieval"]
 ignore_missing_imports = true   # paddleocr / FlagEmbedding / open_clip 无 type stub
+# 本仓库是扁平命名空间包布局（各包均无 __init__.py），显式声明包基址，
+# 避免 Windows 大小写不敏感文件系统把同一文件映射成两个模块名。
+namespace_packages = true
+explicit_package_bases = true
+mypy_path = "."
+# 只门禁 files 列出的三个包：被 import 到的其他第一方模块（ingestion/index）
+# 仅用于取类型，不在门禁里报错，防止把未清理的存量噪声混进本次闸。
+follow_imports = "silent"
 warn_unused_ignores = false
 disallow_untyped_defs = false   # 骨架批次先放开，检索批次逐步收紧
 check_untyped_defs = true
 
+# 已安装但无类型 stub / py.typed 标记的第三方库：逐个声明忽略，消 import-untyped 噪声。
+# 门禁只分析 files 列出的第一方三包；其余依赖只取接口、不报错。
+[[tool.mypy.overrides]]
+module = [
+    "yaml.*", "fitz.*", "pymupdf.*", "pdfplumber.*", "docx.*", "pptx.*",
+    "openpyxl.*", "PIL.*", "PIL.*.*", "qdrant_client.*", "minio.*", "openai.*",
+    "tenacity.*", "tqdm.*", "rapidfuzz.*", "rapidfuzz.*.*", "jieba.*", "FlagEmbedding.*",
+    "paddleocr.*", "open_clip.*", "open_clip.*.*", "numpy.*", "charset_normalizer.*",
+    "psutil.*",
+]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 minversion = "8.0"
 testpaths = ["tests"]
-addopts = "-ra -q"
+pythonpath = ["."]
+# 默认只跑不依赖模型/外部服务的纯离线单测（秒级反馈）；
+# 集成/慢用例用 pytest -m integration / -m slow 显式触发。
+addopts = '-ra -q -m "not integration and not slow"'
 markers = [
-    "slow: 需要加载模型权重或外部服务（qdrant/minio）的测试",
-    "integration: 需要 docker compose 起服务的端到端测试",
+    "slow: 需要加载模型权重的测试（默认不跑，pytest -m slow 显式执行）",
+    "integration: 需要 docker compose 起 qdrant/minio 等外部服务的端到端测试（默认不跑）",
 ]
+
+[tool.coverage.run]
+source = ["config", "generation", "retrieval", "ingestion", "index", "mcp_server"]
+omit = [
+    "data/*",
+    "scripts/*",
+    "tests/*",
+    "*/__init__.py",
+    "_check*.py",
+]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false

@@ -25,6 +25,7 @@ from contextlib import suppress
 from functools import lru_cache
 from typing import Any
 
+from index import resilience
 from ingestion.parsers.common import get_settings
 
 
@@ -268,6 +269,9 @@ def hybrid_search(
     k = 60  # RRF 平滑常数
     w_dense = (weights or {}).get("dense", 1.0)
     w_sparse = (weights or {}).get("sparse", 1.0)
+    # 仅读路径：瞬时网络抖动（连接/超时/5xx）做有界退避重试；重试耗尽后上抛，
+    # 由 retrieval.hybrid_search 的按路降级兑住。
+    attempts, base_delay = resilience.read_retry_policy(get_settings())
 
     # 构造过滤条件
     qdrant_filter: Filter | None = None
@@ -284,11 +288,15 @@ def hybrid_search(
     # dense 搜索
     dense_results: list[dict[str, Any]] = []
     if query_dense and w_dense > 0:
-        dense_hits = client.search(
-            collection_name=coll,
-            query_vector=("dense", query_dense),
-            limit=top_k,
-            query_filter=qdrant_filter,
+        dense_hits = resilience.retry_transient(
+            lambda: client.search(
+                collection_name=coll,
+                query_vector=("dense", query_dense),
+                limit=top_k,
+                query_filter=qdrant_filter,
+            ),
+            attempts=attempts,
+            base_delay=base_delay,
         )
         dense_results = [{"point_id": h.id, "score": h.score, "payload": h.payload} for h in dense_hits]
 
@@ -298,11 +306,15 @@ def hybrid_search(
         from qdrant_client.models import SparseVector as SV
 
         sparse_query = SV(indices=query_sparse["indices"], values=query_sparse["values"])
-        sparse_hits = client.search(
-            collection_name=coll,
-            query_vector=("sparse", sparse_query),
-            limit=top_k,
-            query_filter=qdrant_filter,
+        sparse_hits = resilience.retry_transient(
+            lambda: client.search(
+                collection_name=coll,
+                query_vector=("sparse", sparse_query),
+                limit=top_k,
+                query_filter=qdrant_filter,
+            ),
+            attempts=attempts,
+            base_delay=base_delay,
         )
         sparse_results = [{"point_id": h.id, "score": h.score, "payload": h.payload} for h in sparse_hits]
 

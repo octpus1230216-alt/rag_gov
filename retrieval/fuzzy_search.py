@@ -123,7 +123,9 @@ def _rapidfuzz_search(terms: list[str], top_k: int = 10) -> list[dict[str, Any]]
             s = min(fuzz.WRatio(term, term) / 100.0, 1.0)  # 自身一定 1.0
             chunk_scores[cid] = max(chunk_scores.get(cid, 0), s)
 
-    results = [{"chunk_id": cid, "score": sc} for cid, sc in chunk_scores.items()]
+    results: list[dict[str, Any]] = [
+        {"chunk_id": cid, "score": sc} for cid, sc in chunk_scores.items()
+    ]
     results.sort(key=lambda x: x["score"], reverse=True)
     return results[:top_k]
 

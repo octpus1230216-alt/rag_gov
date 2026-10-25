@@ -1,7 +1,7 @@
 # rag-zh · 高级中文 RAG 系统
 
 面向中文办公文档（PDF / Word / Excel / PPT / 图片）的**多模态检索增强生成**引擎：
-精确 + 模糊 + 稀疏向量 + 稠密向量四路召回，加权 RRF 融合 + 交叉编码器重排，对外以 **MCP** 标准协议暴露工具，可直接接入 Claude Desktop 等 LLM 客户端。
+精确 + 模糊 + 稀疏向量 + 稠密向量四路召回，加权 RRF 融合 + 交叉编码器重排，经可答性闸门后由大模型生成**带引用的答案**，对外以 **MCP** 标准协议暴露工具，可直接接入 Claude Desktop 等 LLM 客户端。
 
 ---
 
@@ -54,7 +54,10 @@ git clone https://github.com/octpus1230216-alt/rag_gov.git && cd rag_gov
 python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -U pip
 
-# ② 一键初始化（装依赖 + 下模型 + 起 Qdrant/MinIO + 建索引 + 建词表）
+# 只想跑离线开发/测试（解析·检索·生成降级，不含 GB 级重模型）：
+#   pip install -e ".[dev]"
+
+# ② 一键初始化（装 .[dev,models] 全量依赖 + 下模型 + 起 Qdrant/MinIO + 建索引 + 建词表）
 cp config/settings.example.yaml config/settings.yaml
 bash scripts/bootstrap.sh
 
@@ -84,10 +87,13 @@ rag-zh/
 ├── embedding/         向量化：text_embedder.py(BGE-M3) + image_embedder.py(Chinese-CLIP)
 ├── index/             索引层：vector_store(Qdrant) + keyword_store(FTS5) + ngram + vocab + metadata
 ├── retrieval/         检索层：query_router + fuzzy + hybrid_search + reranker + context_builder
-├── mcp_server/        MCP 接口：server.py + tools.py（6 个工具）
+├── generation/        生成层：answer_generator + llm_client(OpenAI 兼容) + prompts + answerability
+├── mcp_server/        MCP 接口：server.py + tools.py（7 个工具）
 ├── schemas/           JSON Schema：chunk + mcp_tools
 ├── scripts/           运维脚本：bootstrap.sh / init_qdrant / build_index / rebuild_vocab
 ├── eval/              评测：qa_set.jsonl + run_eval.py
+├── tests/             pytest：unit/（离线快门禁）+ integration/（@slow/@integration）+ helpers/
+├── .github/workflows/ CI：lint(ruff) + type(mypy) + test(pytest+coverage) 三闸
 ├── samples/           示例文档（不含真实数据）
 ├── storage/           运行时产物（SQLite/索引，已 gitignore）
 └── pyproject.toml     依赖与入口锁定
@@ -114,12 +120,29 @@ rag-zh/
 `config/stopwords_zh.txt` 每行一词，UTF-8 无注释。只用于**关键词提取 / n-gram 模糊索引降噪**；
 exact(FTS5) 路不做整句停用词剔除，避免丢掉「2024年」「华东」这类限定词。
 
+### 4.4 generation（生成层 / LLM）
+`ask` 工具走 **OpenAI 兼容接口**（`/v1/chat/completions` 同一套覆盖 OpenAI / DeepSeek / 通义 / vLLM / Ollama 兼容模式），
+凭证一律环境变量注入、**仓库不落任何真实密钥**：
+
+```bash
+export LLM_API_KEY=sk-xxx                              # 必填，未配置时 ask 自动降级为仅返回检索证据（不报错）
+export LLM_BASE_URL=https://api.openai.com/v1          # 换后端只改这个（如本地 Ollama: http://localhost:11434/v1）
+export LLM_MODEL=gpt-4o-mini                            # 模型名
+```
+
+两道质量闸门（详见 `settings.yaml` 的 `generation:` 段）：
+- **可答性判断**（`answerability`）：检索置信度过低 / context 为空时**直接拒答**，不费 token 也不让模型硬编；
+- **降级**（`degraded`）：LLM 未配置 / 鉴权失败 / 超时重试耗尽时，`ask` 返回检索到的 `context` + `sources`，工具仍可用。
+
+> 依赖 `openai` / `tenacity` 已写进 `pyproject.toml`；启用生成前 `pip install -e ".[dev]"` 拉取。
+
 ---
 
 ## 5. MCP 工具列表
 
 | 工具 | 作用 | 关键参数 |
 |------|------|----------|
+| `ask` | **端到端问答**：检索→可答性判断→LLM 生成带 `[N]` 引用的答案 | `query, top_k, mode, filters` |
 | `search` | 混合检索，返回带引用 top-k | `query, top_k, mode(semantic/keyword/fuzzy/hybrid), filters` |
 | `ingest` | 导入文件/目录，跑完整流水线 | `path` |
 | `get_chunk` | 按 chunk_id 取完整片段 | `chunk_id` |
@@ -172,7 +195,68 @@ exact(FTS5) 路不做整句停用词剔除，避免丢掉「2024年」「华东�
 
 ---
 
-## 8. 性能指标（参考）
+## 8. 测试与质量门禁
+
+回归测试由 `pytest` 承载（原先根目录的 `_check_batch*.py` 自检脚本已全部迁移进
+`tests/`）。核心思路：**CI 只跑不依赖重模型与外部服务的纯离线测试**，秒级反馈；
+需要 Qdrant/MinIO/向量化模型的端到端用例打上 `@integration`/`@slow` 标记，默认 deselect。
+
+### 8.1 本地怎么跑
+
+```bash
+pip install -e ".[dev]"          # 轻量依赖即可跑全部离线单测
+
+pytest                           # 默认：只跑 unit（已排除 integration/slow）
+pytest -m integration            # 本地按需跑端到端（需 docker compose + .[dev,models]）
+pytest --cov --cov-report=term-missing   # 覆盖率
+
+ruff check .                     # lint 闸（找真问题：未用 import / 反模式）
+ruff format --check tests generation     # 格式化闸（当前仅覆盖新增代码）
+mypy                             # 类型闸（范围见 pyproject：config/generation/retrieval）
+```
+
+### 8.2 CI 三闸（`.github/workflows/ci.yml`）
+
+push / pull_request 到 `main` 触发，Python 3.10 / 3.11 / 3.12 矩阵并行跑：
+
+| 闸 | 命令 | 作用 |
+|----|------|------|
+| **lint** | `ruff check .` + `ruff format --check tests generation` | 风格与明显错误 |
+| **type** | `mypy` | 三个核心包的类型正确性 |
+| **test** | `pytest --cov --cov-fail-under=50` | 离线单测 + 覆盖率下限 |
+
+三条 job 只 `pip install -e ".[dev]"`（**不下载 torch/paddle**，证明依赖分层生效）；
+CI 上传 `coverage.xml` 为 artifact。`--cov-fail-under` 取当前实测（约 59%）之下的保守
+值 50，随用例补充逐步上调，避免第一天就红灯。
+
+### 8.3 本地 pre-commit（可选，与 CI 同规则）
+
+`.pre-commit-config.yaml` 用 `local` 钩子直接调用项目虚拟环境里**同一套**
+`ruff` / `mypy`（版本与 CI 锁定一致），在提交前先拦一道，范围也与 CI 对齐：
+
+```bash
+.venv\Scripts\activate        # 必须先进入已激活的项目虚拟环境
+pip install -e ".[dev]"        # 已含 pre-commit
+pre-commit install            # 装 git 钩子
+pre-commit run --all-files    # 手动全量跑一遍
+```
+
+钩子覆盖：`ruff check --fix`（全仓）+ `ruff format`（仅 `tests`/`generation`）
++ `mypy`（仅 `config`/`generation`/`retrieval`）。不装 pre-commit 也不影响 CI 主门禁。
+
+### 8.4 门禁拓出的两处真实缺陷（本批修）
+
+把自检脚本迁进 `pytest` 并第一次在**装了 `fastmcp` 的匹配环境**里跑通后，暴露出两个
+此前因 `fastmcp` 缺失而被直接 skip、从未真正执行过的遗留 bug：
+
+| 缺陷 | 现象 | 修法 |
+|------|------|------|
+| `mcp_server/tools.py` 裸用 `@mcp.tool` | `fastmcp==2.2.0` 的 `.tool` 必须带括号，裸写会让 **MCP 服务启动即崩** | 7 处 `@mcp.tool` → `@mcp.tool()` |
+| `pydantic` 版本漂移 | `fastmcp 2.2.0` 从 `pydantic._internal._typing_extra` 导入已被 2.10+ 删除的符号，`import fastmcp` 直接报错 | `pyproject` 钉 `pydantic==2.9.2` |
+
+---
+
+## 9. 性能指标（参考）
 
 | 场景 | 指标 | 说明 |
 |------|------|------|
@@ -185,7 +269,7 @@ exact(FTS5) 路不做整句停用词剔除，避免丢掉「2024年」「华东�
 
 ---
 
-## 9. 常见问题
+## 10. 常见问题
 
 **Q：首次 `search` 卡很久？**
 A：模型懒加载。`bootstrap.sh` 已预下载；服务启动会预热单例。仍慢检查 profile 是否误落 `lite`（CPU）。
@@ -204,7 +288,7 @@ A：本系统在写入前用 jieba **预分词**再进 FTS5（`unicode61`），�
 
 ---
 
-## 10. 许可
+## 11. 许可
 
 本仓库为个人学习与作品展示用途，未附加开源许可证。代码仅供阅读参考；
 如需使用、修改或分发，请先联系仓库所有者取得授权。

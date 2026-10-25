@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import threading
 from functools import lru_cache
 from typing import Any
 
@@ -34,24 +35,29 @@ class Reranker:
         self._device: str = str(active.get("device") or "cpu")
         self._use_fp16: bool = bool(active.get("use_fp16", False))
         self._model: Any = None
+        # 懒加载锁（双检）：与 TextEmbedder 同理，避免并发首次精排时重复构造模型。
+        self._load_lock: threading.Lock = threading.Lock()
 
     def _load(self) -> None:
-        """懒加载 cross-encoder 模型。"""
-        if self._model is not None:
+        """懒加载 cross-encoder 模型（双检锁，并发下只构造一次）。"""
+        if self._model is not None:  # 快路径
             return
-        from FlagEmbedding import FlagReranker
+        with self._load_lock:  # 慢路径：串行化构造
+            if self._model is not None:  # 二次检查
+                return
+            from FlagEmbedding import FlagReranker
 
-        device = self._device
-        # FlagReranker 的 device 参数用 "cpu"/"cuda" 格式
-        if device in ("auto",):
-            device = "cpu"
-        use_fp16 = self._use_fp16 and device != "cpu"
-        self._model = FlagReranker(
-            self._model_name,
-            use_fp16=use_fp16,
-            devices=[device] if device != "cpu" else None,
-            max_length=self._max_length,
-        )
+            device = self._device
+            # FlagReranker 的 device 参数用 "cpu"/"cuda" 格式
+            if device in ("auto",):
+                device = "cpu"
+            use_fp16 = self._use_fp16 and device != "cpu"
+            self._model = FlagReranker(
+                self._model_name,
+                use_fp16=use_fp16,
+                devices=[device] if device != "cpu" else None,
+                max_length=self._max_length,
+            )
 
     def compute_scores(self, pairs: list[tuple[str, str]]) -> list[float]:
         """

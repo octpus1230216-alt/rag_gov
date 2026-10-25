@@ -138,6 +138,9 @@ retrieval:
     sparse: 50
     dense: 50
   recall_top_k: 50                  # RRF 融合后保留条数
+  # 整次在线召回的墙钟预算（秒）：并行四路在此时间内未完成的各路降级为空，
+  # 防止 Qdrant 挂住时把一次检索拖满其连接级 timeout（120s）。
+  recall_timeout_seconds: 3
   rerank:
     enabled: true
     candidates_in: 20               # 送进 reranker 的条数
@@ -163,6 +166,33 @@ context:
   include_source_citation: true     # 每条带 doc_id + chunk_id + 页码，供引用回溯
   dedup_overlap_ratio: 0.85         # 相邻 chunk 重叠度超此值时合并，省 token
   order_by: document                # document(按原文顺序) | score(按分数)
+
+# -----------------------------------------------------------------------------
+# 生成层（RAG 的 “G”）：Query → 检索 → 可答性判断 → LLM 生成带引用答案
+#   供应商走 OpenAI 兼容接口（/v1/chat/completions 同一套覆盖 OpenAI/DeepSeek/
+#   通义/vLLM/Ollama 兼容模式），凭证一律环境变量注入，仓库不落任何真实密钥。
+#   未配置 LLM_API_KEY 时不报错：answer 工具自动降级为「仅返回检索证据」。
+# -----------------------------------------------------------------------------
+generation:
+  provider: openai_compatible
+  base_url: ${LLM_BASE_URL:-https://api.openai.com/v1}
+  api_key: ${LLM_API_KEY:-}              # 绝不写死，仅环境变量注入
+  model: ${LLM_MODEL:-gpt-4o-mini}
+  temperature: 0.2                        # 事实型问答压低随机性，减少幻觉
+  max_tokens: 1024
+  timeout_seconds: 30
+  max_retries: 2                          # 仅对限流/超时/5xx 指数退避重试
+  language: zh
+  # ---- 可答性闸门（调 LLM 前判「资料够不够」，宁可拒答也不硬编）----
+  answerability:
+    strategy: rule                        # rule(默认，零成本) | llm_judge(预留，本批不实现)
+    min_rerank_score: 0.30                # 最高 rerank 分低于此值判为不可答（无 rerank 分时不套用）
+    require_non_empty_context: true       # 检索 context 为空直接拒答
+    refusal_message: "根据知识库现有内容无法可靠回答该问题。"
+  # ---- 提示词 ----
+  prompt:
+    wrap_context_as_data: true            # 把检索正文包进数据块，防入库文档的提示注入
+    system_template_path: null            # 指一个 UTF-8 文本文件可覆盖内置 system 指令
 
 # -----------------------------------------------------------------------------
 # 向量化
@@ -198,17 +228,32 @@ qdrant:
     max_wait_seconds: 30
 
 # -----------------------------------------------------------------------------
+# 外部存储容错（读路径）
+#   实现见 index/resilience.py：只对「瞬时网络故障」（连接/超时/5xx）退避重试；
+#   4xx/鉴权/参数错立即失败。写入路径（upsert/delete）不自动重试。
+#   检索侧另有 retrieval.recall_timeout_seconds 作为整次召回的墙钟预算与兜底降级。
+# -----------------------------------------------------------------------------
+resilience:
+  qdrant:
+    retry_attempts: 3              # 读路径瞬时错误最大尝试次数（含首次）；<=1 即不重试
+    retry_base_delay_seconds: 0.2  # 指数退避基数（第 n 次前 sleep base*2**(n-1)）
+  # MinIO 仅客户端单例（presign 本地签名、无网络），故不配超时/重试
+
+# -----------------------------------------------------------------------------
 # MinIO 连接（原文存储，仓库里不放任何真实密钥）
 # -----------------------------------------------------------------------------
 minio:
   endpoint: ${MINIO_ENDPOINT:-localhost:9000}
-  access_key: ${MINIO_ACCESS_KEY:-minioadmin}
-  secret_key: ${MINIO_SECRET_KEY:-minioadmin}
+  # 去弱默认凭据：不再写死 minioadmin。留空时 get_document_url 会拒绝签发下载链接，
+  # 命中已知弱口令（minioadmin/admin/...）也会被 mcp_server.security 拦下。
+  access_key: ${MINIO_ACCESS_KEY:-}
+  secret_key: ${MINIO_SECRET_KEY:-}
   bucket: ${MINIO_BUCKET:-rag-zh-raw}
   secure: false
   region: us-east-1
   # 对象命名规则：{source_format}/{doc_id}/{原文件名}，便于按来源批量清理
   object_key_prefix: raw
+  # 实际有效期 = min(本值, security.max_presigned_seconds)，默认被压到 <=300s
   presigned_expire_seconds: 3600
 
 # -----------------------------------------------------------------------------
@@ -255,6 +300,18 @@ lexicon:
   jieba_user_dict_paths: []
 
 # -----------------------------------------------------------------------------
+# 安全边界（应用层）
+#   只作用于 MCP 工具入参（远程不可信面）；本地 CLI / scripts 的 --input 视为受信操作者，
+#   不受 ingest_roots 沙箱约束。落地实现见 mcp_server/security.py。
+# -----------------------------------------------------------------------------
+security:
+  # 允许 ingest / classify_image 读取的根目录白名单；环境变量
+  # RAG_ZH_ALLOWED_INGEST_ROOTS（按 os.pathsep / ';' 分隔）优先级更高。
+  ingest_roots: ["${RAG_ZH_DATA_DIR:-data}"]
+  # 预签名下载 URL 有效期的硬上限（秒）；minio.presigned_expire_seconds 超过它被压回此值。
+  max_presigned_seconds: 300
+
+# -----------------------------------------------------------------------------
 # MCP 接口
 # -----------------------------------------------------------------------------
 mcp:
@@ -262,8 +319,11 @@ mcp:
   # sse  ：供 Web / 远程客户端使用，对应 docker-compose 的 8000 端口
   transports: [stdio, sse]
   sse:
-    host: 0.0.0.0
+    host: 127.0.0.1                 # 默认只绑本机；绑非回环地址必须配 auth_token 才允许启动
     port: 8000
+  # SSE 绑非本机地址（如 0.0.0.0）时的 bearer token；本机回环可留空。
+  # 也可用环境变量 MCP_AUTH_TOKEN 覆盖。远程暴露建议经反向代理注入该 token。
+  auth_token: ${MCP_AUTH_TOKEN:-}
   server_name: rag-zh
   instructions: "中文文档三模检索（语义/精确/模糊），返回带引用的 top-k 片段"
 
@@ -278,3 +338,21 @@ runtime:
   resume: true
   fail_fast: false
   max_retries_per_doc: 2
+
+# -----------------------------------------------------------------------------
+# 日志（可观测性）
+#   统一由 config/logging_setup.py 读取。三条红线：
+#     1. stdio MCP 下 stdout 被 JSON-RPC 独占，日志流式 handler 一律走 stderr；
+#     2. 只记元数据（工具名/request_id/耗时/条数/错误类型），绝不记 query 正文与
+#        检索/答案内容（可能含入库文档敏感信息）；
+#     3. request_id 用 contextvar 承载，按请求隔离，四路并行召回/线程/异步都不串号。
+#   level 与旧 runtime.log_level 兼容：logging.level 优先，缺省回落 runtime.log_level。
+# -----------------------------------------------------------------------------
+logging:
+  level: ${RAG_ZH_LOG_LEVEL:-INFO}      # DEBUG | INFO | WARNING | ERROR
+  directory: logs                       # 日志目录（相对产物根 / 进程工作目录）
+  file_name: rag_zh.log                 # 轮转日志文件名
+  to_stderr: true                       # 流式输出走 stderr（stdio 安全），不会污染 stdout
+  to_file: true                         # 同时落 directory/file_name（ RollingFile 轮转）
+  max_bytes: 10485760                   # 单文件 10MB 后轮转
+  backup_count: 5                       # 保留 5 个历史文件

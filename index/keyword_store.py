@@ -21,6 +21,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 from contextlib import suppress
@@ -144,6 +145,10 @@ def init_tables() -> None:
         """)
 
     conn.commit()
+    # 表建好后跑 schema 迁移（PRAGMA user_version 驱动，幂等）：把既有库升到 SCHEMA_VERSION
+    from index.schema_migrations import run_migrations
+
+    run_migrations(conn)
     _INITIALISED = True
 
 
@@ -162,6 +167,25 @@ def _tokenize_for_fts(text: str) -> str:
 
 
 # =================================================================== 写入
+def _chunk_row(chunk: dict[str, Any]) -> tuple[Any, ...]:
+    """
+    把一个 chunk 整理成 chunks 表的 7 元组（chunk_id, doc_id, content, chunk_type,
+    section_path, bbox, metadata）。单条写与批量写共用，保证 bbox/metadata 的
+    JSON 序列化口径与列顺序完全一致。
+    """
+    bbox_json = json.dumps(chunk.get("bbox")) if chunk.get("bbox") else None
+    meta_json = json.dumps(chunk.get("metadata") or {}, ensure_ascii=False)
+    return (
+        chunk.get("chunk_id", ""),
+        chunk.get("doc_id", ""),
+        chunk.get("content", ""),
+        chunk.get("chunk_type", "text"),
+        chunk.get("section_path", ""),
+        bbox_json,
+        meta_json,
+    )
+
+
 def insert_chunk(chunk: dict[str, Any]) -> None:
     """
     写入一个 chunk 到 chunks 表 + FTS5 虚拟表。
@@ -169,37 +193,51 @@ def insert_chunk(chunk: dict[str, Any]) -> None:
     """
     init_tables()
     conn = get_connection()
-    chunk_id = chunk.get("chunk_id", "")
-    content = chunk.get("content", "")
-    doc_id = chunk.get("doc_id", "")
-    chunk_type = chunk.get("chunk_type", "text")
-    section_path = chunk.get("section_path", "")
-    import json
-    bbox_json = json.dumps(chunk.get("bbox")) if chunk.get("bbox") else None
-    meta_json = json.dumps(chunk.get("metadata") or {}, ensure_ascii=False)
-
     conn.execute(
         "INSERT OR REPLACE INTO chunks(chunk_id, doc_id, content, chunk_type, section_path, bbox, metadata) "
         "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (chunk_id, doc_id, content, chunk_type, section_path, bbox_json, meta_json),
+        _chunk_row(chunk),
     )
 
     # FTS5 写 jieba 预分词结果
-    tokenized = _tokenize_for_fts(content)
+    tokenized = _tokenize_for_fts(chunk.get("content", ""))
     conn.execute(
         "INSERT OR REPLACE INTO fts_chunks_virt(chunk_id, content) VALUES (?, ?)",
-        (chunk_id, tokenized),
+        (chunk.get("chunk_id", ""), tokenized),
     )
     conn.commit()
 
 
 def insert_chunks_batch(chunks: list[dict[str, Any]]) -> int:
-    """批量写入，返回成功条数。"""
-    count = 0
-    for c in chunks:
-        insert_chunk(c)
-        count += 1
-    return count
+    """
+    批量写入 chunk（chunks + fts 两张表），返回成功条数。
+
+    与逐条 insert_chunk 的区别：**整批只提交一次事务**。逐条写会在每个 chunk 上
+    触发一次 WAL fsync（N 条 = N 次 commit），大批量入库时是主要瓶颈；这里用两次
+    executemany + 一次 commit，中途异常整批 rollback，不留半批。
+    幂等口径不变（INSERT OR REPLACE）。
+    """
+    if not chunks:
+        return 0
+    init_tables()
+    conn = get_connection()
+    chunk_rows = [_chunk_row(c) for c in chunks]
+    fts_rows = [(c.get("chunk_id", ""), _tokenize_for_fts(c.get("content", ""))) for c in chunks]
+    try:
+        conn.executemany(
+            "INSERT OR REPLACE INTO chunks(chunk_id, doc_id, content, chunk_type, section_path, bbox, metadata) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            chunk_rows,
+        )
+        conn.executemany(
+            "INSERT OR REPLACE INTO fts_chunks_virt(chunk_id, content) VALUES (?, ?)",
+            fts_rows,
+        )
+        conn.commit()  # 整批一次提交
+    except Exception:
+        conn.rollback()  # 半途失败不留下半批
+        raise
+    return len(chunks)
 
 
 def delete_chunks_by_doc(doc_id: str) -> None:

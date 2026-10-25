@@ -97,6 +97,28 @@ def build_ngram_index(chunks: list[dict[str, Any]], batch_commit: int = 500) -> 
     return total_rows
 
 
+# =================================================================== 删除
+def delete_by_doc(doc_id: str) -> int:
+    """
+    删除某文档全部 chunk 的 ngram 行（重建/删除时清理模糊路，避免孤儿）。
+
+    红线：**必须在删 chunks 表之前调用** —— ngram_index 只有 chunk_id、没有 doc_id，
+    只能靠 `chunk_id IN (SELECT chunk_id FROM chunks WHERE doc_id=?)` 反查定位；
+    chunks 一旦先删，这条子查询恒空，ngram 行就永久残留了。
+    返回删除的行数（无匹配时为 0，天然幂等）。
+    """
+    from index.keyword_store import get_connection, init_tables
+
+    init_tables()
+    conn = get_connection()
+    cur = conn.execute(
+        "DELETE FROM ngram_index WHERE chunk_id IN (SELECT chunk_id FROM chunks WHERE doc_id = ?)",
+        (doc_id,),
+    )
+    conn.commit()
+    return cur.rowcount
+
+
 # =================================================================== 查询
 def ngram_search(query: str, top_k: int = 20) -> list[dict[str, Any]]:
     """

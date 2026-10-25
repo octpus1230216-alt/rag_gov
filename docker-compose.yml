@@ -18,6 +18,11 @@
 #   两种改法，任选其一：
 #     A. 改 .env（或导出环境变量）：RAG_ZH_MEM_LIMIT_MCP / _QDRANT / _MINIO
 #     B. 直接改下面各服务的 mem_limit 字面量
+#
+# 安全默认（本批）：
+#   - MinIO 凭据改为**必填**（${VAR:?...}）：未设则 compose 直接失败，不再回落 minioadmin。
+#   - 各服务对外端口默认只绑 127.0.0.1（回环）；需远程访问请显式改成 0.0.0.0 并配
+#     MCP_AUTH_TOKEN / 反向代理，切勿裸暴露。
 #   注意：memory 是硬上限（超限 OOM kill）。embedding / reranker 加载权重时
 #   峰值内存最高，lite 档请把 batch_size 保持 4 并确认 device=cpu。
 #   GPU 显存不受此处限制，由 config/settings.yaml 的 device 字段控制。
@@ -48,8 +53,8 @@ x-mcp-common-env: &mcp-common-env
   QDRANT_COLLECTION: ${QDRANT_COLLECTION:-rag_zh_chunks}
   # 对象存储
   MINIO_ENDPOINT: minio:9000
-  MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
-  MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
+  MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:?MINIO_ACCESS_KEY is required}
+  MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:?MINIO_SECRET_KEY is required}
   MINIO_BUCKET: ${MINIO_BUCKET:-rag-zh-raw}
   MINIO_SECURE: "false"
   # 模型缓存目录（挂载 ./storage/models，避免每次重建镜像都重新下载权重）
@@ -57,6 +62,9 @@ x-mcp-common-env: &mcp-common-env
   PADDLE_PDX_CACHE_HOME: /app/storage/models/paddle
   # 日志
   RAG_ZH_LOG_LEVEL: ${RAG_ZH_LOG_LEVEL:-INFO}
+  # SSE 在容器内绑 0.0.0.0（对外），启动门禁要求必须有 token；否则 server 拒绝启动。
+  # 远程暴露另经反向代理注入 Authorization: Bearer <MCP_AUTH_TOKEN>。
+  MCP_AUTH_TOKEN: ${MCP_AUTH_TOKEN:?MCP_AUTH_TOKEN is required for SSE}
   PYTHONUNBUFFERED: "1"
 
 services:
@@ -69,8 +77,8 @@ services:
     container_name: rag-zh-qdrant
     restart: unless-stopped
     ports:
-      - "${QDRANT_HTTP_PORT:-6333}:6333"   # REST
-      - "${QDRANT_GRPC_PORT_HOST:-6334}:6334"  # gRPC（写入更快，100GB 库推荐）
+      - "127.0.0.1:${QDRANT_HTTP_PORT:-6333}:6333"   # REST（默认只绑回环）
+      - "127.0.0.1:${QDRANT_GRPC_PORT_HOST:-6334}:6334"  # gRPC（写入更快，100GB 库推荐）
     environment:
       QDRANT__LOG_LEVEL: INFO
     volumes:
@@ -103,11 +111,11 @@ services:
     restart: unless-stopped
     command: ["server", "/data", "--console-address", ":9001"]
     ports:
-      - "${MINIO_API_PORT:-9000}:9000"     # S3 API
-      - "${MINIO_CONSOLE_PORT:-9001}:9001"  # Web 控制台
+      - "127.0.0.1:${MINIO_API_PORT:-9000}:9000"     # S3 API（默认只绑回环）
+      - "127.0.0.1:${MINIO_CONSOLE_PORT:-9001}:9001"  # Web 控制台
     environment:
-      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-minioadmin}
-      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-minioadmin}
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:?MINIO_ACCESS_KEY is required}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:?MINIO_SECRET_KEY is required}
       MINIO_CONSOLE_ADDRESS: ":9001"
     volumes:
       - ./storage/minio:/data
@@ -115,7 +123,7 @@ services:
     healthcheck:
       test:
         - CMD-SHELL
-        - "mc ready local || mc alias set local http://127.0.0.1:9000 ${MINIO_ACCESS_KEY:-minioadmin} ${MINIO_SECRET_KEY:-minioadmin} || exit 1"
+        - "mc ready local || exit 1"
       interval: 15s
       timeout: 5s
       retries: 10
@@ -131,26 +139,27 @@ services:
   mcp-server:
     build:
       context: .
-      dockerfile: Dockerfile        # 后续批次提供；本批 compose 仅声明构建入口
+      dockerfile: Dockerfile        # 本批已提供（lite 档：仅核心运行时依赖）
       args:
         # 有 GPU 时置为 cuda-enabled 的基础镜像层配置；lite/standard 用默认 CPU 镜像
         RAG_ZH_DEVICE: ${RAG_ZH_DEVICE:-cpu}
     image: rag-zh/mcp-server:latest
     container_name: rag-zh-mcp-server
     restart: unless-stopped
-    # 默认走 sse；本地调试 stdio 时用 `docker compose run --rm mcp-server python -m mcp_server.server`
-    command: ["python", "-m", "mcp_server.server", "--sse"]
+    # 默认走 sse（容器内绑 0.0.0.0，对外由 127.0.0.1 映射的端口 + token 门禁保护）；
+    # 本地调试 stdio 时用 `docker compose run --rm mcp-server python -m mcp_server.server`
+    # --port 8000 与镜像 EXPOSE/HEALTHCHECK、下方 8000:8000 映射对齐（server 默认 8765，须显式指定）
+    command: ["python", "-m", "mcp_server.server", "--sse", "--host", "0.0.0.0", "--port", "8000"]
     environment:
       <<: *mcp-common-env
       MCP_TRANSPORT: sse
-      MCP_HOST: 0.0.0.0
       MCP_PORT: "8000"
     ports:
-      - "${MCP_SSE_PORT:-8000}:8000"
+      - "127.0.0.1:${MCP_SSE_PORT:-8000}:8000"
     volumes:
       - ./data:/app/data
       - ./storage:/app/storage
-      - ./config:/app/config
+      - ./config:/app/config:ro   # 只读配置：应用不写配置目录（日志文件不可写时自动降级 stderr）
     mem_limit: ${RAG_ZH_MEM_LIMIT_MCP:-10g}
     # 有 GPU 时取消注释（lite 档请保持注释，纯 CPU 推理）
     # deploy:

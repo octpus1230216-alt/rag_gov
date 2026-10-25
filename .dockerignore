@@ -1,0 +1,66 @@
+# =============================================================================
+# rag-zh 构建上下文忽略清单
+#
+# 为什么关键：docker-compose 的 build.context 是仓库根「.」，若不忽略
+#   ./storage（Qdrant + MinIO + 模型权重）、./data、./models 等 GB 级目录，
+#   docker build 会先把整个上下文打包上传给 daemon —— 极慢甚至 OOM。
+# 这里只保留构建镜像真正需要的：pyproject.toml + 各第一方 Python 包目录。
+# =============================================================================
+
+# ---- 版本控制 / CI / 本地工具缓存 ----
+.git
+.gitignore
+.github
+.venv
+venv
+env
+.uv-cache
+.uv-python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+.pre-commit-config.yaml
+
+# ---- 数据与索引产物（体积大 / 可再生 / 含敏感原文，绝不进上下文）----
+data/
+storage/
+models/
+parsed/
+chunks/
+vectors/
+logs/
+log_me/
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
+*.sqlite-journal
+*.wal
+*.shm
+*.parquet
+*.log
+
+# ---- 密钥与本地配置（真实 settings.yaml 由宿主 bind-mount :ro 提供）----
+.env
+.env.*
+config/settings.yaml
+
+# ---- 测试 / 样例 / 临时物（运行镜像不需要）----
+tests/
+samples/
+eval/
+schemas/
+_tmp_batch*/
+_ignore_check/
+
+# ---- 覆盖率与构建自身 ----
+# 注意：README.md 不能忽略 —— pyproject 声明 readme = "README.md"，
+# 缺失会让 `pip install .` 在构建阶段报 "readme file not found"。
+coverage.xml
+htmlcov/
+Dockerfile
+.dockerignore
+docker-compose.yml

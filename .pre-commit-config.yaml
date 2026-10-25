@@ -1,0 +1,40 @@
+# =============================================================================
+# 本地 pre-commit —— 提交前的轻量门禁（可选加分项，不影响 CI 主闸）
+#
+# 用 local 钩子直接调用「项目虚拟环境里那套」ruff / mypy，版本与 CI 完全一致、
+# 规则同 pyproject、范围同 ci.yml，避免另装一份工具产生口径漂移。
+#
+# 前提：必须在「已激活的项目虚拟环境」里用（`python` 即 .venv 的解释器）：
+#   .venv\Scripts\activate            # Windows
+#   pip install -e ".[dev]"           # dev extras 已含 pre-commit
+#   pre-commit install                # 安装 git pre-commit 钩子
+#   pre-commit run --all-files        # 手动对全仓跑一遍
+# =============================================================================
+repos:
+  - repo: local
+    hooks:
+      # lint 闸：全仓（与 CI 的 `ruff check .` 同规则，能自动修的先修）
+      - id: ruff-check
+        name: ruff check (lint, 全仓)
+        entry: python -m ruff check --fix
+        language: system
+        types: [python]
+
+      # 格式化闸：仅 tests/ 与 generation/（与 CI 同范围，既有源码暂不纳入）
+      - id: ruff-format
+        name: ruff format (仅 tests/generation)
+        entry: python -m ruff format
+        language: system
+        types: [python]
+        files: ^(tests|generation)/
+
+      # 类型闸：跑裸 mypy（范围取 pyproject 的 files=config/generation/retrieval），
+      # pass_filenames=false 保证与 CI 完全一致（CI 也是直接 `mypy`）。
+      - id: mypy
+        name: mypy (config/generation/retrieval)
+        entry: python -m mypy
+        language: system
+        types: [python]
+        files: ^(config|generation|retrieval)/.*\.py$
+        pass_filenames: false
+        always_run: true

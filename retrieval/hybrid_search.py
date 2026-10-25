@@ -20,11 +20,18 @@
 
 from __future__ import annotations
 
+import logging
+import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import TimeoutError as _FuturesTimeout
 from typing import Any
 
 from ingestion.parsers.common import get_settings
 from retrieval.query_router import get_route_candidates, route
+
+# 各路召回延迟/条数埋点。脱敏红线：只记 route / count / elapsed，绝不记 query 正文。
+logger = logging.getLogger("rag_zh.retrieval.hybrid")
 
 
 class HybridSearcher:
@@ -40,6 +47,10 @@ class HybridSearcher:
         self._rerank_output_top_k: int = int(rerank_cfg.get("output_top_k") or 10)
         self._rerank_threshold: float = float(rerank_cfg.get("score_threshold") or 0.15)
         self._route_candidates = get_route_candidates()
+        # 整次在线召回的墙钟预算（秒）：超时未完成的各路降级为空，不把一次检索拖满
+        # Qdrant 连接级 timeout（120s）。
+        rcfg_for_timeout = get_settings().get("retrieval") or {}
+        self._recall_timeout: float = float(rcfg_for_timeout.get("recall_timeout_seconds") or 3.0)
 
     def search(
         self,
@@ -66,11 +77,12 @@ class HybridSearcher:
           }
         """
         weights = route(query)
+        started = time.perf_counter()
 
         # 按 mode 决定启用哪些路
         active_routes = self._resolve_routes(mode, weights)
 
-        # 并行召回
+        # 并行召回（各路耗时/条数在 _parallel_recall 内逐路 DEBUG）
         route_results = self._parallel_recall(query, active_routes, filters)
 
         # 加权 RRF 融合
@@ -94,6 +106,17 @@ class HybridSearcher:
         from retrieval.context_builder import build_context
 
         context_result = build_context(final)
+
+        logger.info(
+            "search done mode=%s query_len=%d routes=%s recalled=%d fused=%d final=%d elapsed=%.3fs",
+            mode,
+            len(query or ""),
+            sorted(active_routes),
+            sum(len(v) for v in route_results.values()),
+            len(fused),
+            len(final),
+            time.perf_counter() - started,
+        )
 
         return {
             "results": final,
@@ -128,34 +151,77 @@ class HybridSearcher:
         """
         results: dict[str, list[dict[str, Any]]] = {}
         max_workers = len(active_routes) or 1
-
-        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="recall") as pool:
-            futures = {}
-
+        pool = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="recall")
+        futures: dict[Any, str] = {}
+        try:
             if "exact" in active_routes:
                 top_k = self._route_candidates.get("exact", 50)
-                futures[pool.submit(self._recall_exact, query, top_k)] = "exact"
+                futures[pool.submit(self._timed, "exact", self._recall_exact, query, top_k)] = "exact"
 
             if "fuzzy" in active_routes:
                 top_k = self._route_candidates.get("fuzzy", 20)
-                futures[pool.submit(self._recall_fuzzy, query, top_k)] = "fuzzy"
+                futures[pool.submit(self._timed, "fuzzy", self._recall_fuzzy, query, top_k)] = "fuzzy"
 
             if "sparse" in active_routes:
                 top_k = self._route_candidates.get("sparse", 50)
-                futures[pool.submit(self._recall_sparse, query, top_k, filters)] = "sparse"
+                futures[
+                    pool.submit(self._timed, "sparse", self._recall_sparse, query, top_k, filters)
+                ] = "sparse"
 
             if "dense" in active_routes:
                 top_k = self._route_candidates.get("dense", 50)
-                futures[pool.submit(self._recall_dense, query, top_k, filters)] = "dense"
+                futures[
+                    pool.submit(self._timed, "dense", self._recall_dense, query, top_k, filters)
+                ] = "dense"
 
-            for future in as_completed(futures):
-                route_name = futures[future]
-                try:
-                    results[route_name] = future.result()
-                except Exception:
+            finished: set[str] = set()
+            try:
+                for future in as_completed(futures, timeout=self._recall_timeout):
+                    route_name = futures[future]
+                    finished.add(route_name)
+                    try:
+                        results[route_name] = future.result()
+                    except Exception:  # 某路挂掉不能拖垮整个检索：记错后按空结果降级
+                        logger.exception("recall route=%s failed, degrade to empty", route_name)
+                        results[route_name] = []
+            except _FuturesTimeout:
+                # 超出整次召回墙钟预算：未完成的各路按空结果降级，不继续等（如 Qdrant 挂住）
+                pass
+            for future, route_name in futures.items():
+                if route_name not in finished:
+                    future.cancel()
+                    logger.warning(
+                        "recall route=%s exceeded budget %.1fs, degrade to empty",
+                        route_name,
+                        self._recall_timeout,
+                    )
                     results[route_name] = []
+        finally:
+            # wait=False：预算已到就立即返回，孤儿线程由其自身 client timeout 收尾
+            pool.shutdown(wait=False, cancel_futures=True)
 
         return results
+
+    @staticmethod
+    def _timed(
+        route_name: str, fn: Callable[..., list[dict[str, Any]]], *args: Any
+    ) -> list[dict[str, Any]]:
+        """在工作线程内度量单路召回的真实耗时与条数（DEBUG，不记 query 正文）。"""
+        started = time.perf_counter()
+        try:
+            items = fn(*args)
+        except Exception:
+            logger.debug(
+                "recall route=%s raised elapsed=%.3fs", route_name, time.perf_counter() - started
+            )
+            raise
+        logger.debug(
+            "recall route=%s count=%d elapsed=%.3fs",
+            route_name,
+            len(items),
+            time.perf_counter() - started,
+        )
+        return items
 
     # ---------------------------------------------------------------- 各路召回实现
 

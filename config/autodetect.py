@@ -356,7 +356,19 @@ def load_settings(settings_path: str | os.PathLike[str] | None = None) -> dict[s
     settings.setdefault("parsing", {})
     settings.setdefault("lexicon", {"synonyms_path": "config/synonyms.yaml",
                                     "stopwords_path": "config/stopwords_zh.txt"})
+    settings.setdefault("generation", {})
     settings.setdefault("mcp", {})
+    # 日志段兜底：模板被删改时仍给出一份可跑的最小配置，logging_setup 读不到会再兜底一次
+    settings.setdefault(
+        "logging",
+        {
+            "level": "INFO",
+            "directory": "logs",
+            "file_name": "rag_zh.log",
+            "to_stderr": True,
+            "to_file": True,
+        },
+    )
 
     # RRF 权重与四路开关：sparse 不可用时归一化重分配（不补零向量）
     retrieval = settings["retrieval"]

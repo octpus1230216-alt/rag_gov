@@ -64,8 +64,8 @@ import argparse
 import hashlib
 import io
 import json
+import logging
 import os
-import sys
 import time
 import traceback
 from collections.abc import Iterable, Sequence
@@ -88,6 +88,11 @@ from ingestion.parsers.pdf_parser import parse_pdf
 from ingestion.parsers.pptx_parser import parse_pptx
 from ingestion.parsers.txt_parser import parse_txt
 from ingestion.parsers.xlsx_parser import parse_xlsx
+
+# 统一日志：阶段里程碑走 INFO，坏文件走 ERROR（含 traceback）。
+# 红线：绝不用 print 到 stdout —— MCP stdio 下 stdout 是 JSON-RPC 通道；日志经
+# config.logging_setup 统一挂到 stderr + 文件。tqdm 进度条本身默认写 stderr，保留。
+logger = logging.getLogger("rag_zh.pipeline")
 
 # ---------------------------------------------------------------- 阶段表
 STAGES: tuple[str, ...] = ("parse", "classify", "chunk", "embed", "index")
@@ -712,10 +717,14 @@ def do_index(
             embeddings.append({"dense": rec.pop("dense", []), "sparse": rec.pop("sparse", None)})
             chunks.append(rec)
 
-    from index import keyword_store, metadata_store, ngram_index
+    from index import keyword_store, lifecycle, metadata_store, ngram_index
     from index.vector_store import upsert_chunks
 
     keyword_store.init_tables()
+    # 0) 先整体清掉本文档在索引层的旧数据（SQLite 四表 + Qdrant），再写新数据：
+    #    重新切分会改变 chunk_id，只 upsert 会让旧 chunk 变成永久孤儿。Qdrant 不可达
+    #    时 purge_index 内部降级为 warning（strict=False），本地先清后写照常完成。
+    lifecycle.purge_index(doc_id, root=root, vectors=True, strict=False)
     # 1) 元数据登记（documents 表），供 list_documents / get_document_url 定位原文
     metadata_store.register_parsed_document(parsed, source_path=str(parsed.get("source_file", "")))
     if chunks:
@@ -872,7 +881,7 @@ def _iter_progress(iterable: Iterable[Any], total: int, desc: str) -> Iterable[A
     def _plain() -> Iterable[Any]:
         for count, item in enumerate(iterable, start=1):
             if count == 1 or count % 50 == 0 or count == total:
-                print(f"{desc}: {count}/{total}", flush=True)
+                logger.info("%s: %d/%d", desc, count, total)
             yield item
 
     return _plain()
@@ -961,7 +970,7 @@ def run(
         "reports": [],
     }
     if not files:
-        print(f"[pipeline] 没有可处理的文件：{input_path}")
+        logger.warning("没有可处理的文件：%s", input_path)
         return summary
 
     if token_backend:
@@ -992,6 +1001,14 @@ def run(
     ]
 
     n_workers = _resolve_workers(workers, len(tasks))
+    logger.info(
+        "pipeline start stages=%s total=%d workers=%d id_strategy=%s token_backend=%s",
+        "->".join(summary["stages"]),
+        len(tasks),
+        n_workers,
+        summary["id_strategy"],
+        summary["token_backend"],
+    )
     started = time.time()
     if n_workers <= 1 or len(tasks) == 1:
         for report in _iter_progress((process_file(t) for t in tasks), len(tasks), "入库"):
@@ -1007,6 +1024,15 @@ def run(
 
     summary["workers"] = n_workers
     summary["elapsed"] = round(time.time() - started, 2)
+    logger.info(
+        "pipeline done done=%d partial=%d error=%d n_chunks=%d n_vectors=%d elapsed=%.2fs",
+        summary["done"],
+        summary["partial"],
+        summary["error"],
+        summary["n_chunks"],
+        summary["n_vectors"],
+        summary["elapsed"],
+    )
     _print_summary(summary)
     return summary
 
@@ -1040,6 +1066,14 @@ def _fold_report(report: dict[str, Any], summary: dict[str, Any], err_log: Path,
     elif status == STATUS_ERROR:
         summary["error"] += 1
         _append_jsonl(err_log, report)
+        # 坏文件点名 ERROR（哪个路径、挂在哪阶段），单文件失败不拖垮整批
+        logger.error(
+            "file failed file=%s doc_id=%s stage=%s error=%s",
+            report.get("file"),
+            report.get("doc_id"),
+            report.get("failed_stage"),
+            report.get("error"),
+        )
         if fail_fast:
             raise RuntimeError(f"文件处理失败（fail_fast）: {report['file']} @ {report['failed_stage']} -> {report['error']}")
     summary["n_chunks"] += int(report.get("n_chunks") or 0)
@@ -1047,25 +1081,39 @@ def _fold_report(report: dict[str, Any], summary: dict[str, Any], err_log: Path,
 
 
 def _print_summary(summary: dict[str, Any]) -> None:
-    """收尾打印：总数/成功/失败/跳过，失败文件带完整路径，pending 阶段点名说明。"""
-    print("=" * 60)
-    print(
-        f"[pipeline] 输入={summary['input']} 阶段={'->'.join(summary['stages'])} "
-        f"进程数={summary.get('workers')} doc_id策略={summary.get('id_strategy')} "
-        f"token估算={summary['token_backend']}"
+    """收尾日志：总数/成功/失败/跳过，失败文件带完整路径，pending 阶段点名说明。
+
+    名保留 _print_summary 但实际走 logger（stderr）：MCP stdio 下不能往 stdout 刷字。
+    """
+    logger.info(
+        "汇总 输入=%s 阶段=%s 进程数=%s doc_id策略=%s token估算=%s",
+        summary["input"],
+        "->".join(summary["stages"]),
+        summary.get("workers"),
+        summary.get("id_strategy"),
+        summary["token_backend"],
     )
-    print(
-        f"  文件 {summary['total']} | 完成 {summary['done']}（其中全部跳过 {summary['fully_skipped']}）"
-        f" | 部分完成 {summary['partial']} | 失败 {summary['error']} "
-        f"| chunk 总数 {summary['n_chunks']} | 向量总数 {summary.get('n_vectors', 0)} | 耗时 {summary['elapsed']}s"
+    logger.info(
+        "  文件 %d | 完成 %d（其中全部跳过 %d）| 部分完成 %d | 失败 %d "
+        "| chunk 总数 %d | 向量总数 %d | 耗时 %ss",
+        summary["total"],
+        summary["done"],
+        summary["fully_skipped"],
+        summary["partial"],
+        summary["error"],
+        summary["n_chunks"],
+        summary.get("n_vectors", 0),
+        summary["elapsed"],
     )
     if summary["skipped_stages"]:
-        print(f"  [注意] 以下阶段未实现已跳过：{'、'.join(summary['skipped_stages'])}")
+        logger.warning("以下阶段未实现已跳过：%s", "、".join(summary["skipped_stages"]))
     failed = [r for r in summary["reports"] if r["status"] == STATUS_ERROR]
     for report in failed[:20]:
-        print(f"  [失败] {report['file']} @ {report['failed_stage']} -> {report['error']}")
+        logger.error(
+            "  [失败] %s @ %s -> %s", report["file"], report["failed_stage"], report["error"]
+        )
     if len(failed) > 20:
-        print(f"  [失败] 其余 {len(failed) - 20} 个见日志")
+        logger.error("  [失败] 其余 %d 个见日志", len(failed) - 20)
 
 
 def rebuild_chunks(
@@ -1138,6 +1186,10 @@ def build_cli() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    # CLI 独立跑时自行初始化日志（走 stderr）；被 MCP ingest 调用时 server 已初始化，重复调用幂等。
+    from config.logging_setup import setup_logging
+
+    setup_logging()
     args = build_cli().parse_args(argv)
     cfg: dict[str, Any] = {}
     if args.chunk_size:
@@ -1158,7 +1210,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             token_backend=args.token_backend,
         )
     except Exception as exc:
-        print(f"[pipeline] 致命错误: {type(exc).__name__}: {exc}", file=sys.stderr)
+        logger.exception("致命错误: %s: %s", type(exc).__name__, exc)
         return 2
     # 有文件失败就返回 1，方便 shell/CI 里判断这批有没有漏入库的文件
     return 1 if summary["error"] else 0

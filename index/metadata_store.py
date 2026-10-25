@@ -33,9 +33,10 @@ def insert_document(doc: dict[str, Any]) -> None:
 
     init_tables()
     conn = get_connection()
+    now = utc_now_iso()
     conn.execute(
-        """INSERT OR REPLACE INTO documents(doc_id, path, source_format, doc_type, language, sha256, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        """INSERT OR REPLACE INTO documents(doc_id, path, source_format, doc_type, language, sha256, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             doc.get("doc_id", ""),
             doc.get("path", ""),
@@ -43,7 +44,8 @@ def insert_document(doc: dict[str, Any]) -> None:
             doc.get("doc_type", "unknown"),
             doc.get("language", "zh"),
             doc.get("sha256", ""),
-            doc.get("created_at") or utc_now_iso(),
+            doc.get("created_at") or now,
+            doc.get("updated_at") or now,
         ),
     )
     conn.commit()
@@ -96,16 +98,37 @@ def list_documents(
     return [dict(row) for row in rows]
 
 
-def delete_document(doc_id: str) -> None:
-    """删除文档记录及其全部 chunk（级联清理）。"""
+def purge_document_sqlite(doc_id: str) -> dict[str, int]:
+    """
+    清空某文档在 SQLite 侧的全部痕迹（documents/chunks/fts/ngram 四表）。
+
+    删除顺序有硬约束：
+      1. ngram 靠 join chunks 定位 chunk_id，必须**最先删**（趁 chunks 还在）；
+      2. 先取出本 doc 的 chunk_id 列表删 fts_chunks_virt（FTS5 虚表不能按 doc_id 过
+         滤，只能逐 chunk_id 删）；
+      3. 再删 chunks、最后删 documents（外键 chunks.doc_id -> documents.doc_id）。
+    返回 {chunks, fts, ngram} 各表删除行数，供上层埋点与断言。
+    """
+    from index import ngram_index
     from index.keyword_store import get_connection, init_tables
 
     init_tables()
     conn = get_connection()
+    ids = [r["chunk_id"] for r in conn.execute("SELECT chunk_id FROM chunks WHERE doc_id = ?", (doc_id,))]
+    n_ngram = ngram_index.delete_by_doc(doc_id)  # 依赖 chunks 还在，最先删
+    n_fts = 0
+    for chunk_id in ids:
+        cur = conn.execute("DELETE FROM fts_chunks_virt WHERE chunk_id = ?", (chunk_id,))
+        n_fts += cur.rowcount
     conn.execute("DELETE FROM chunks WHERE doc_id = ?", (doc_id,))
-    conn.execute("DELETE FROM fts_chunks_virt WHERE chunk_id IN (SELECT chunk_id FROM chunks WHERE doc_id = ?)", (doc_id,))
     conn.execute("DELETE FROM documents WHERE doc_id = ?", (doc_id,))
     conn.commit()
+    return {"chunks": len(ids), "fts": n_fts, "ngram": n_ngram}
+
+
+def delete_document(doc_id: str) -> None:
+    """删除文档记录及其全部 chunk（级联清理 SQLite 四表）。向后兼容的薄封装。"""
+    purge_document_sqlite(doc_id)
 
 
 def count_documents() -> int:

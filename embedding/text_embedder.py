@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any
@@ -50,32 +51,38 @@ class TextEmbedder:
         )
         self._model: Any = None
         self._device: str = str(active.get("device") or "cpu")
+        # 懒加载锁：并行召回（sparse/dense 两线程）首次同时 encode 时，防止两个线程
+        # 都越过判空、各加载一份 ~2GB 权重（内存翻倍 + 半初始化模型被使用）。
+        self._load_lock: threading.Lock = threading.Lock()
 
     def _load_model(self) -> None:
-        """懒加载：第一次 encode 时才把权重读进内存/显存。"""
-        if self._model is not None:
+        """懒加载（双检锁）：第一次 encode 时才把权重读进内存/显存，且并发下只加载一次。"""
+        if self._model is not None:  # 快路径：已加载则不加锁
             return
-        if self._supports_sparse:
-            # BGE-M3：同时支持 dense + sparse(lexical_weights) + colbert + multi-vector
-            from FlagEmbedding import BGEM3FlagModel
+        with self._load_lock:  # 慢路径：串行化构造
+            if self._model is not None:  # 二次检查：他线程已在锁内加载完毕
+                return
+            if self._supports_sparse:
+                # BGE-M3：同时支持 dense + sparse(lexical_weights) + colbert + multi-vector
+                from FlagEmbedding import BGEM3FlagModel
 
-            self._model = BGEM3FlagModel(
-                self._model_name,
-                use_fp16=self._use_fp16,
-                device=self._device if self._device != "auto" else None,
-                max_length=self._max_seq_length,
-            )
-        else:
-            # 降级：bge-small-zh-v1.5 只有 dense，没有 sparse 能力
-            from FlagEmbedding import FlagModel
+                self._model = BGEM3FlagModel(
+                    self._model_name,
+                    use_fp16=self._use_fp16,
+                    device=self._device if self._device != "auto" else None,
+                    max_length=self._max_seq_length,
+                )
+            else:
+                # 降级：bge-small-zh-v1.5 只有 dense，没有 sparse 能力
+                from FlagEmbedding import FlagModel
 
-            self._model = FlagModel(
-                self._model_name,
-                use_fp16=self._use_fp16,
-                query_instruction_for_retrieval="",
-                devices=[self._device] if self._device != "auto" else None,
-                max_length=self._max_seq_length,
-            )
+                self._model = FlagModel(
+                    self._model_name,
+                    use_fp16=self._use_fp16,
+                    query_instruction_for_retrieval="",
+                    devices=[self._device] if self._device != "auto" else None,
+                    max_length=self._max_seq_length,
+                )
 
     @property
     def dim(self) -> int:

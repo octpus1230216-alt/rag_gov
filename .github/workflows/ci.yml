@@ -1,0 +1,118 @@
+# =============================================================================
+# rag-zh CI —— 质量门禁四闸（ruff check / ruff format / mypy / pytest），
+# 外加 build-image 冒烟（验证 lite Dockerfile 与 .dockerignore 可构建）
+#
+# 说明：lint job 同时跑 ruff check 与 ruff format --check，故称“四闸三 job”。
+#
+# 设计原则：
+#   - 只跑「不依赖重模型与外部服务」的纯离线测试（pyproject 里 addopts 已 deselect
+#     integration/slow），装依赖走轻量 extras `.[dev]`，秒级反馈、不下载 torch/paddle。
+#   - 三条 job 并行，任一红灯即整条流水线失败。
+#   - Python 3.10 / 3.11 / 3.12 矩阵（项目 requires-python>=3.10）。
+# =============================================================================
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# 同一分支上的旧运行会被新提交取消，省额度
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # -------------------------------------------------------------- 1) lint 闸
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install dev tooling (轻量，不含重模型)
+        run: |
+          python -m pip install -U pip
+          pip install -e ".[dev]"
+      # 全仓 lint（找真问题：未用 import / 逻辑反模式）
+      - name: ruff check
+        run: ruff check .
+      # 格式化闸仅覆盖 tests/ 与 generation/（既有源码尚未规范化，留待后续批次）
+      - name: ruff format --check (tests, generation)
+        run: ruff format --check tests generation
+
+  # -------------------------------------------------------------- 2) type 闸
+  type:
+    name: Type check (mypy)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install dev tooling
+        run: |
+          python -m pip install -U pip
+          pip install -e ".[dev]"
+      # 门禁范围由 pyproject [tool.mypy].files 决定（config / generation / retrieval）
+      - name: mypy
+        run: mypy
+
+  # -------------------------------------------------------------- 3) test 闸
+  test:
+    name: Test (pytest + coverage)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install dev tooling
+        run: |
+          python -m pip install -U pip
+          pip install -e ".[dev]"
+      # 纯离线单测（addopts 已排除 integration/slow）；覆盖率阈值随用例补充逐步上调
+      - name: pytest (offline unit tests + coverage)
+        run: pytest --cov --cov-report=term-missing --cov-report=xml --cov-fail-under=50
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-py${{ matrix.python-version }}
+          path: coverage.xml
+          if-no-files-found: ignore
+
+  # -------------------------------------------------------------- 4) 镜像构建冒烟
+  # 只验证 lite Dockerfile + .dockerignore 能成功构建（不 push）；
+  # 与三闸并行，使 Dockerfile 回归能在 CI 亮红灯。ubuntu-latest 自带 docker。
+  build-image:
+    name: Build image (lite smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: docker build
+        run: docker build -t rag-zh/mcp-server:ci .
